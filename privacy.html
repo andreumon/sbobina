@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sbobina – Privacy</title>
+  <link rel="stylesheet" href="css/app.css">
+  <style>
+    .doc { max-width: 680px; margin: 0 auto; padding: 48px 20px 64px; font: 400 1.05rem/1.7 var(--serif); }
+    .doc h1 { font: 600 2rem/1.2 var(--serif); margin: 0 0 8px; }
+    .doc h2 { font: 600 1.15rem/1.3 var(--serif); margin: 32px 0 6px; }
+    .doc .meta { font-family: var(--sans); }
+  </style>
+</head>
+<body>
+  <main class="doc">
+    <h1>Informativa sulla privacy</h1>
+    <p class="meta">Sbobina, uso personale. Ultimo aggiornamento: ottobre 2026.</p>
+
+    <h2>Chi gestisce l'app</h2>
+    <p>Sbobina è un'app personale per trascrivere lezioni universitarie. Non ha un server proprio: gira interamente nel browser di chi la usa.</p>
+
+    <h2>Quali dati tratta</h2>
+    <p>Le registrazioni audio che l'utente sceglie di trascrivere, i testi che ne derivano, i nomi dei corsi e i termini tecnici, la chiave API Gemini dell'utente.</p>
+
+    <h2>Dove finiscono</h2>
+    <p>Restano nel browser del dispositivo e, se l'utente collega Google Drive, nella cartella "Sbobina" del suo Drive e nella cartella nascosta riservata all'app. L'audio viene inviato alla Gemini API di Google solo per essere trascritto, con la chiave dell'utente; si applicano i <a href="https://ai.google.dev/gemini-api/terms">termini della Gemini API</a>.</p>
+
+    <h2>Accesso a Google Drive</h2>
+    <p>Sbobina chiede solo due permessi: <code>drive.file</code>, che consente di vedere e modificare esclusivamente i file creati dall'app, e <code>drive.appdata</code>, per le impostazioni. Non legge il resto del Drive. I dati non vengono venduti, condivisi con terzi o usati per pubblicità.</p>
+
+    <h2>Come cancellarli</h2>
+    <p>Elimina la cartella "Sbobina" dal tuo Drive, revoca l'accesso da <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a> e cancella i dati del sito dal browser.</p>
+
+    <p><a href="./">Torna a Sbobina</a></p>
+  </main>
+</body>
+</html>

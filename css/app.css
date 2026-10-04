@@ -353,3 +353,7 @@ button.quiet:hover { color: var(--ink); text-decoration-color: var(--accent); }
 }
 
 #sChunk { width: 100%; max-width: 360px; accent-color: var(--accent); }
+
+.diag-row { margin-top: 4px; }
+.diag { white-space: pre-wrap; font: 0.8rem/1.5 var(--sans); color: var(--muted); background: var(--surface);
+  border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; margin: 8px 0 0; max-height: 320px; overflow: auto; user-select: text; }

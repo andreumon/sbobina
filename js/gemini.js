@@ -9,8 +9,44 @@ const sleep = (ms, signal) => new Promise((resolve, reject) => {
 });
 
 export class ApiError extends Error {
-  constructor(message, status, body) { super(message); this.status = status; this.body = body; }
+  constructor(message, status, body) {
+    super(message);
+    this.status = status;
+    this.body = body;
+    this.detail = errorDetail(body);
+  }
 }
+
+/** Dettagli tecnici di un errore Google (campo sbagliato, motivo), utili per la diagnosi. */
+export function errorDetail(body) {
+  const e = body?.error;
+  if (!e) return '';
+  const out = [];
+  if (e.status) out.push(e.status);
+  for (const d of e.details || []) {
+    for (const v of d.fieldViolations || []) out.push(`${v.field || '?'}: ${v.description || ''}`.trim());
+    if (d.reason) out.push(d.reason);
+    if (d.metadata) out.push(Object.entries(d.metadata).map(([k, v]) => `${k}=${v}`).join(', '));
+  }
+  return out.filter(Boolean).join('; ');
+}
+
+/** Blob → base64 (per l'audio inviato direttamente dentro la richiesta). */
+export function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(',')[1] || '');
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
+const audioItem = a => (a.uri
+  ? { type: 'audio', uri: a.uri, mime_type: a.mimeType }
+  : { type: 'audio', data: a.data, mime_type: a.mimeType });
+const audioPart = a => (a.uri
+  ? { fileData: { fileUri: a.uri, mimeType: a.mimeType } }
+  : { inlineData: { mimeType: a.mimeType, data: a.data } });
 
 function retryDelayMs(body) {
   const info = (body?.error?.details || []).find(d => String(d['@type'] || '').includes('RetryInfo'));
@@ -24,11 +60,14 @@ export function explainError(e) {
   const msg = e?.message || String(e);
   const s = e?.status;
   if (/API key not valid|API_KEY_INVALID/i.test(msg)) return 'La chiave API Gemini non è valida. Controllala nelle impostazioni.';
+  if (/ACCESS_TOKEN_TYPE_UNSUPPORTED/i.test(msg) || (s === 401 && /token type/i.test(msg))) {
+    return 'Google ha rifiutato il tipo di chiave (problema noto di alcune chiavi "AQ."). Crea una nuova chiave in AI Studio e riprova; se persiste, segnalalo.';
+  }
   if (s === 429) return 'Quota gratuita Gemini esaurita per ora (troppe richieste). Riprova più tardi: l\'elaborazione ripartirà dal punto in cui si è fermata.';
   if (s === 403) return `Accesso negato dalla Gemini API: ${msg}`;
   if (s === 404) return `Modello o risorsa non trovati: ${msg}. Controlla i nomi dei modelli nelle impostazioni.`;
   if (s === 0) return 'Connessione assente o interrotta. L\'elaborazione ripartirà dal punto in cui si è fermata.';
-  return msg;
+  return e?.detail ? `${msg} (${e.detail})` : msg;
 }
 
 export class Gemini {
@@ -180,12 +219,16 @@ export class Gemini {
     return extractText(out);
   }
 
-  /** Richiesta multimodale generica (audio opzionale + testo), con ripiego su generateContent. */
-  async generate({ model, prompt, audio, label }) {
-    const input = [];
-    if (audio) input.push({ type: 'audio', uri: audio.uri, mime_type: audio.mimeType });
-    input.push({ type: 'text', text: prompt });
-    if (!this.legacy) {
+  /**
+   * Richiesta multimodale (audio opzionale + testo).
+   * audio: { uri, mimeType } dopo un caricamento, oppure { data, mimeType } in base64.
+   * endpoint: 'interactions' (predefinito) o 'generate' (generateContent).
+   */
+  async generate({ model, prompt, audio, label, endpoint = 'interactions' }) {
+    if (endpoint === 'interactions' && !this.legacy) {
+      const input = [];
+      if (audio) input.push(audioItem(audio));
+      input.push({ type: 'text', text: prompt });
       try {
         return await this.interact({ model, input }, label);
       } catch (e) {
@@ -195,7 +238,7 @@ export class Gemini {
       }
     }
     const parts = [];
-    if (audio) parts.push({ fileData: { fileUri: audio.uri, mimeType: audio.mimeType } });
+    if (audio) parts.push(audioPart(audio));
     parts.push({ text: prompt });
     const { body } = await this.call(`/v1beta/models/${model}:generateContent`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -209,7 +252,7 @@ export class Gemini {
     const cfg = {};
     if (language) cfg.language_codes = [language];
     if (vocabulary?.length) cfg.custom_vocabulary = vocabulary;
-    const body = { model, input: [{ type: 'audio', uri: audio.uri, mime_type: audio.mimeType }] };
+    const body = { model, input: [audioItem(audio)] };
     if (Object.keys(cfg).length) body.generation_config = { transcription_config: cfg };
     return this.interact(body, 'Trascrizione');
   }

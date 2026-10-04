@@ -8,6 +8,7 @@ import { Player } from './player.js';
 import { processJob } from './pipeline.js';
 import { Gemini, explainError } from './gemini.js';
 import { guessMime } from './aac.js';
+import { diagnose, describeStrategy, saveStrategy, resetStrategy, loadStrategy } from './strategy.js';
 import {
   fmtTime, lectureParagraphs, toMarkdown, safeFileName, countUncertain, toEditable, parseEditable,
 } from './text.js';
@@ -376,6 +377,7 @@ function progressText(job, p) {
   switch (p.step) {
     case 'fetch': return `Recupero l'audio da Drive… ${Math.round((p.progress || 0) * 100)}%`;
     case 'plan': return 'Analizzo l\'audio e cerco le pause…';
+    case 'diagnose': return `Google ha rifiutato la richiesta: provo alcune varianti${p.label ? ` (${p.label})` : ''}…`;
     case 'upload': return `${part}invio a Gemini ${Math.round((p.progress || 0) * 100)}%`;
     case 'transcribe': return `${part}trascrizione letterale…`;
     case 'revise': return `${part}revisione e controllo…`;
@@ -386,6 +388,7 @@ function progressText(job, p) {
 
 function progressFraction(job, p) {
   const n = p.total || job.chunks?.length || 1;
+  if (p.step === 'diagnose') return 0.03;
   const w = { plan: 0, fetch: 0, upload: 0.15 * (p.progress || 0), transcribe: 0.2, revise: 0.6, done: 1 }[p.step] ?? 0;
   if (p.step === 'done') return 1;
   if (p.step === 'plan' || p.step === 'fetch') return 0.02;
@@ -887,6 +890,39 @@ $('sKeyTest').addEventListener('click', async () => {
     out.textContent = explainError(e);
   }
 });
+$('sDiag').addEventListener('click', async () => {
+  const out = $('sDiagOut');
+  const btn = $('sDiag');
+  if (!settings.apiKey) { out.hidden = false; out.textContent = 'Inserisci prima la chiave API.'; return; }
+  btn.disabled = true;
+  out.hidden = false;
+  out.textContent = 'Provo le varianti della richiesta (circa un minuto)…';
+  try {
+    // Se c'è una lezione con l'audio su questo dispositivo, si prova anche il suo formato.
+    let audio = null;
+    for (const j of await store.listJobs()) { audio = await store.getAudio(j.id); if (audio) break; }
+    const lines = [];
+    const { strategy, results } = await diagnose(new Gemini(settings.apiKey), {
+      audio, settings, onStep: label => { out.textContent = `${lines.join('\n')}\n… ${label}`.trim(); },
+    });
+    for (const r of results) lines.push(`${r.ok ? 'OK ' : 'NO '} ${r.label}${r.ok ? '' : `\n    ${r.error}`}`);
+    if (strategy) {
+      saveStrategy(strategy);
+      lines.push('', `Variante scelta: ${describeStrategy(strategy)}`);
+    } else lines.push('', 'Nessuna variante accettata: copia questo testo e mandalo a chi ti aiuta.');
+    out.textContent = lines.join('\n');
+  } catch (e) {
+    out.textContent = explainError(e);
+  } finally {
+    btn.disabled = false;
+  }
+});
+$('sDiagReset').addEventListener('click', () => {
+  resetStrategy();
+  $('sDiagOut').hidden = false;
+  $('sDiagOut').textContent = 'Tornato alla variante predefinita.';
+});
+
 $('sChunk').addEventListener('input', () => { $('sChunkOut').textContent = $('sChunk').value; });
 $('sChunk').addEventListener('change', () => saveSetting({ chunkMin: Number($('sChunk').value) }));
 $('sRevise').addEventListener('change', () => { saveSetting({ revise: $('sRevise').checked }); $('sRelisten').disabled = !$('sRevise').checked; });

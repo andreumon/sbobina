@@ -22,7 +22,7 @@ Ti servono un account Google e un account GitHub (gratuito).
 ### 1. Chiave Gemini (2 minuti)
 
 1. Vai su [aistudio.google.com/apikey](https://aistudio.google.com/apikey) con il tuo account Google.
-2. Premi **Create API key** e copia la chiave (inizia con `AIza`).
+2. Premi **Create API key** e copia la chiave. Dal 28 maggio 2026 le chiavi nuove iniziano con `AQ.`: sono le nuove "chiavi di autenticazione" di Google, e vanno benissimo. Le vecchie chiavi iniziavano con `AIza`.
 3. La inserirai nell'app al primo avvio, in *Impostazioni → Gemini*. Basta farlo su un dispositivo: poi viaggia via Drive.
 
 ### 2. Pubblica il sito su GitHub Pages (5 minuti)
@@ -49,7 +49,9 @@ Serve perché il tuo sito possa leggere e scrivere i file di Sbobina nel tuo Dri
    - `https://www.googleapis.com/auth/drive.appdata`
 
    Google li classifica **non sensibili**. Il primo dà accesso solo ai file creati da Sbobina, non al resto del tuo Drive.
-5. **Pubblico → Pubblica app** (stato *In produzione*). Se resti in *Test*, aggiungi la tua email tra gli *Utenti di test*: funziona lo stesso, ma Google ti richiede il consenso più spesso.
+5. **Pubblico**: hai due strade.
+   - *Rapida*: lascia lo stato su **Test** e, in *Utenti di test*, premi **Add users** e aggiungi la tua email. Funziona subito. Google ti chiederà di riconfermare l'accesso ogni tanto: un tocco nel popup.
+   - *Definitiva*: in **Branding** compila *Home page dell'applicazione* con `https://TUONOME.github.io/sbobina/` e *Norme sulla privacy* con `https://TUONOME.github.io/sbobina/privacy.html` (la pagina è già inclusa). In *Domini autorizzati* aggiungi `TUONOME.github.io`, salva, poi torna su **Pubblico → Pubblica app**.
 6. **Client**: premi **Crea client**.
    - Tipo: **Applicazione web**.
    - In *Origini JavaScript autorizzate* aggiungi `https://TUONOME.github.io`: niente barra finale e niente `/sbobina`.

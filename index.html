@@ -166,12 +166,17 @@
             <div class="field">
               <label for="sKey">Chiave API</label>
               <div class="row">
-                <input id="sKey" type="password" placeholder="AIza…" spellcheck="false">
+                <input id="sKey" type="password" placeholder="AQ.…" spellcheck="false">
                 <button type="button" class="quiet" id="sKeyShow">Mostra</button>
                 <button type="button" id="sKeyTest">Verifica</button>
               </div>
               <p class="help">Gratuita da <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. Resta tua: va solo a Google, e su Drive nelle impostazioni nascoste di Sbobina.</p>
               <p class="help result" id="sKeyResult"></p>
+              <div class="row diag-row">
+                <button type="button" class="quiet" id="sDiag">Diagnostica la connessione con Gemini</button>
+                <button type="button" class="quiet" id="sDiagReset">Ripristina predefinita</button>
+              </div>
+              <pre class="diag" id="sDiagOut" hidden></pre>
             </div>
           </fieldset>
 
