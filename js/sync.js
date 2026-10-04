@@ -64,12 +64,15 @@ export class Sync {
   }
 
   async syncSettings() {
+    // Unione campo per campo (e corso per corso), non "vince tutto l'ultimo che salva":
+    // così una modifica fatta su un dispositivo non cancella quelle fatte sull'altro.
     const local = store.loadSettings();
     const remote = await this.drive.readAppFile(SETTINGS_FILE);
-    if (remote?.data && (remote.data.updatedAt || 0) > (local.updatedAt || 0)) {
-      store.saveSettings(remote.data, { fromRemote: true });
-    } else if (!remote || (local.updatedAt || 0) > (remote.data?.updatedAt || 0)) {
-      await this.drive.writeAppFile(remote?.id, SETTINGS_FILE, store.syncedSettings(local));
+    const merged = remote?.data ? store.mergeSettings(local, remote.data) : local;
+    const same = store.sameSettings;
+    if (!same(merged, local)) store.saveSettings(store.syncedSettings(merged), { fromRemote: true });
+    if (!remote?.data || !same(merged, remote.data)) {
+      await this.drive.writeAppFile(remote?.id, SETTINGS_FILE, store.syncedSettings(merged));
     }
   }
 

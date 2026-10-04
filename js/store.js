@@ -65,11 +65,69 @@ export function loadSettings() {
 }
 
 export function saveSettings(patch, { fromRemote = false } = {}) {
-  const s = { ...loadSettings(), ...patch };
-  if (!fromRemote) s.updatedAt = Date.now();
+  const prev = loadSettings();
+  const s = { ...prev, ...patch };
+  if (!fromRemote) {
+    const t = Date.now();
+    s.updatedAt = t;
+    s.fieldsAt = { ...(prev.fieldsAt || {}) };
+    for (const k of Object.keys(patch)) if (k !== 'courses') s.fieldsAt[k] = t;
+    if (patch.courses) {
+      // Ogni corso porta la data della sua ultima modifica; quelli tolti diventano "eliminati".
+      const old = new Map((prev.courses || []).map(c => [c.name, c]));
+      const strip = ({ at, ...c }) => JSON.stringify(c);
+      s.courses = patch.courses.map(c => {
+        const o = old.get(c.name);
+        return o && strip(o) === strip(c) ? { ...c, at: o.at || 0 } : { ...c, at: t };
+      });
+      s.coursesDeleted = { ...(prev.coursesDeleted || {}) };
+      const now = new Set(s.courses.map(c => c.name));
+      for (const name of old.keys()) if (!now.has(name)) s.coursesDeleted[name] = t;
+      for (const name of now) delete s.coursesDeleted[name];
+    }
+  }
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
   emit('settings', { settings: s, fromRemote });
   return s;
+}
+
+/**
+ * Unisce le impostazioni locali con quelle su Drive senza perdere modifiche fatte altrove:
+ * per ogni campo vince la modifica più recente; i corsi si uniscono uno per uno
+ * (vince la versione più recente di ciascuno; un'eliminazione più recente lo toglie).
+ * Le impostazioni salvate da versioni precedenti (senza date per campo) contano con la loro data globale.
+ */
+export function mergeSettings(local, remote) {
+  const fieldTime = (s, k) => (s.fieldsAt ? s.fieldsAt[k] || 0 : s.updatedAt || 0);
+  const out = { ...local, fieldsAt: { ...(local.fieldsAt || {}) } };
+  for (const k of Object.keys(DEFAULTS)) {
+    if (['courses', 'fieldsAt', 'coursesDeleted', 'updatedAt'].includes(k)) continue;
+    if (!(k in remote)) continue;
+    const tr = fieldTime(remote, k), tl = fieldTime(local, k);
+    if (tr > tl) { out[k] = remote[k]; out.fieldsAt[k] = tr; }
+  }
+  const deleted = { ...(local.coursesDeleted || {}) };
+  for (const [n, t] of Object.entries(remote.coursesDeleted || {})) deleted[n] = Math.max(deleted[n] || 0, t);
+  const byName = new Map();
+  for (const c of [...(local.courses || []), ...(Array.isArray(remote.courses) ? remote.courses : [])]) {
+    const cur = byName.get(c.name);
+    if (!cur || (c.at || 0) > (cur.at || 0)) byName.set(c.name, c);
+  }
+  out.courses = [...byName.values()]
+    .filter(c => !(deleted[c.name] > (c.at || 0)))
+    .sort((a, b) => a.name.localeCompare(b.name, 'it'));
+  for (const c of out.courses) delete deleted[c.name];
+  out.coursesDeleted = deleted;
+  out.updatedAt = Math.max(local.updatedAt || 0, remote.updatedAt || 0);
+  return out;
+}
+
+/** Le due versioni delle impostazioni sincronizzate sono uguali? (indipendente dall'ordine delle chiavi) */
+export function sameSettings(a, b) {
+  const stable = v => (Array.isArray(v) ? `[${v.map(stable).join(',')}]`
+    : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${stable(v[k])}`).join(',')}}`
+      : JSON.stringify(v ?? null));
+  return stable(syncedSettings({ ...DEFAULTS, ...a })) === stable(syncedSettings({ ...DEFAULTS, ...b }));
 }
 
 export function syncedSettings(s = loadSettings()) {

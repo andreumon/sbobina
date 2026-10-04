@@ -11,4 +11,8 @@ export const DEFAULTS = {
   relisten: true,
   courses: [],
   updatedAt: 0,
+  // Per sincronizzare senza perdere modifiche: quando è stato cambiato ogni campo,
+  // e quando è stato eliminato ogni corso (così l'unione non lo fa ricomparire).
+  fieldsAt: {},
+  coursesDeleted: {},
 };

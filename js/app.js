@@ -341,8 +341,8 @@ $('courseFileInput').addEventListener('change', e => {
 });
 
 // Spostare una lezione in un altro corso
-function fillMoveSelect(job) {
-  const names = settings.courses.map(c => c.name);
+async function fillMoveSelect(job) {
+  const names = allCourseNames(await store.listJobs());
   if (job.course && !names.includes(job.course)) names.push(job.course);
   $('moveSel').innerHTML = '<option value="">Senza corso</option>' +
     names.map(n => `<option${n === job.course ? ' selected' : ''}>${esc(n)}</option>`).join('');
@@ -414,11 +414,17 @@ function renderNew() {
   const sel = $('newCourse');
   const last = state.pendingCourse ?? store.device.get('lastCourse', '');
   state.pendingCourse = null;
-  sel.innerHTML = '<option value="">Nessun corso</option>' +
-    settings.courses.map(c => `<option${c.name === last ? ' selected' : ''}>${esc(c.name)}</option>`).join('') +
-    '<option value="__new">Nuovo corso…</option>';
-  $('newCourseName').hidden = true;
-  fillGlossary();
+  const fill = names => {
+    sel.innerHTML = '<option value="">Nessun corso</option>' +
+      names.map(n => `<option${n === last ? ' selected' : ''}>${esc(n)}</option>`).join('') +
+      '<option value="__new">Nuovo corso…</option>';
+    $('newCourseName').hidden = true;
+    fillGlossary();
+  };
+  // Stessa lista della schermata principale: anche i corsi che compaiono solo nelle lezioni
+  // (es. creati su un altro dispositivo e non ancora arrivati nelle impostazioni).
+  fill(allCourseNames([]));
+  store.listJobs().then(jobs => { if (sel.value === '' || sel.value === last) fill(allCourseNames(jobs)); });
 }
 
 function fillGlossary() {
@@ -968,7 +974,7 @@ async function lectureAction(act, id, from = 'menu') {
       break;
     case 'move':
       if (from === 'page') {
-        fillMoveSelect(job);
+        await fillMoveSelect(job);
         $('moveRow').hidden = !$('moveRow').hidden;
         if (!$('moveRow').hidden) $('moveSel').focus();
         break;
