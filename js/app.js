@@ -224,6 +224,7 @@ async function openCourse(name, { push = true } = {}) {
   $('courseKeywords').value = course?.glossary || '';
   $('courseLang').innerHTML = langOptions(course?.lang || 'it');
   $('courseDrive').hidden = !course || !drive.configured;
+  renderCourseFolder(course?.name);
   $('courseSave').textContent = course ? 'Salva modifiche' : 'Crea corso';
   $('courseDelete').hidden = !course;
   $('courseAddRec').hidden = !course;
@@ -255,6 +256,8 @@ $('courseForm').addEventListener('submit', async e => {
   courses.sort((a, b) => a.name.localeCompare(b.name, 'it'));
   settings = store.saveSettings({ courses });
   if (oldName && oldName !== name) {
+    const h = await store.kv.get(`dirHandle:${oldName}`);
+    if (h) { await store.kv.set(`dirHandle:${name}`, h); await store.kv.del(`dirHandle:${oldName}`); }
     for (const j of await store.listJobs()) if (j.course === oldName) await store.updateJob(j.id, x => { x.course = name; });
     const closed = new Set(store.device.get('closedFolders', []));
     if (closed.delete(oldName)) { closed.add(name); store.device.set('closedFolders', [...closed]); }
@@ -276,6 +279,7 @@ $('courseDelete').addEventListener('click', async () => {
     : `Eliminare il corso "${name}"?`;
   if (!confirm(msg)) return;
   settings = store.saveSettings({ courses: settings.courses.filter(c => c.name !== name) });
+  await store.kv.del(`dirHandle:${name}`);
   for (const j of await store.listJobs()) if (j.course === name) await store.updateJob(j.id, x => { x.course = ''; });
   show('home');
   history.pushState({ v: 'home' }, '');
@@ -285,6 +289,39 @@ $('courseDelete').addEventListener('click', async () => {
     await sync.run();
     drive.trashCourseFolderIfEmpty(name).catch(() => {});
   }
+});
+
+async function renderCourseFolder(name) {
+  const box = $('courseFolder');
+  box.hidden = !canPickFolder || !name;
+  if (box.hidden) return;
+  const own = await store.kv.get(`dirHandle:${name}`);
+  const general = await store.kv.get('dirHandle');
+  $('courseFolderState').innerHTML = own
+    ? `I .md di questo corso vanno in <b>${esc(own.name)}</b>.`
+    : general ? `Nessuna cartella propria: si usa quella generale, <b>${esc(general.name)}</b>.` : 'Nessuna cartella: "Salva .md" scarica il file nei Download.';
+  $('courseFolderPick').textContent = own ? 'Cambia cartella' : 'Scegli cartella';
+  $('courseFolderClear').hidden = !own;
+}
+$('courseFolderPick').addEventListener('click', async () => {
+  const name = state.courseName;
+  if (!name) return;
+  try {
+    const handle = await window.showDirectoryPicker({ id: `sbobina-${name.replace(/[^\w-]/g, '').slice(0, 24) || 'corso'}`, mode: 'readwrite' });
+    await store.kv.set(`dirHandle:${name}`, handle);
+    if (store.device.get('folderAuto', null) === null) store.device.set('folderAuto', true);
+    renderCourseFolder(name);
+    const jobs = (await store.listJobs()).filter(j => j.course === name && (j.chunks?.some(c => c.raw) || j.edited));
+    if (jobs.length && confirm(`Salvare adesso in ${handle.name} anche le ${jobs.length} lezioni già trascritte di questo corso?`)) {
+      let n = 0;
+      for (const j of jobs) if (await writeToFolder(j, handle, n === 0)) n++;
+      toast(`${n} ${n === 1 ? 'lezione salvata' : 'lezioni salvate'} in ${handle.name}`);
+    }
+  } catch (e) { if (e.name !== 'AbortError') toast(e.message); }
+});
+$('courseFolderClear').addEventListener('click', async () => {
+  await store.kv.del(`dirHandle:${state.courseName}`);
+  renderCourseFolder(state.courseName);
 });
 
 $('courseDrive').addEventListener('click', async () => {
@@ -902,7 +939,7 @@ async function lectureAction(act, id, from = 'menu') {
       try { await navigator.clipboard.writeText(md); toast('Testo copiato'); } catch { toast('Copia non riuscita'); }
       break;
     case 'save': {
-      const handle = canPickFolder ? await store.kv.get('dirHandle') : null;
+      const handle = await folderFor(job);
       if (handle && await writeToFolder(job, handle, true)) { toast(`Salvata in ${handle.name}/${name}`); break; }
       download(name, md);
       break;
@@ -1131,6 +1168,16 @@ document.addEventListener('keydown', e => {
 // Cartella sul PC (File System Access API, Chrome/Edge desktop)
 // ====================================================================
 
+/** Cartella di salvataggio per una lezione: quella del suo corso, altrimenti quella generale. */
+async function folderFor(job) {
+  if (!canPickFolder) return null;
+  if (job?.course) {
+    const h = await store.kv.get(`dirHandle:${job.course}`);
+    if (h) return h;
+  }
+  return store.kv.get('dirHandle');
+}
+
 async function writeToFolder(job, handle, interactive) {
   try {
     let perm = await handle.queryPermission({ mode: 'readwrite' });
@@ -1149,7 +1196,7 @@ async function writeToFolder(job, handle, interactive) {
 
 async function autoSaveToFolder(job) {
   if (!canPickFolder || !store.device.get('folderAuto', false)) return;
-  const handle = await store.kv.get('dirHandle');
+  const handle = await folderFor(job);
   if (handle) await writeToFolder(job, handle, false);
 }
 
@@ -1359,7 +1406,7 @@ async function renderFolderState() {
   $('sFolderPick').textContent = handle ? 'Cambia cartella' : 'Scegli cartella';
   $('sFolderAll').hidden = !handle;
   $('sFolderAuto').checked = store.device.get('folderAuto', false);
-  $('sFolderAuto').disabled = !handle;
+  $('sFolderAuto').disabled = false;
 }
 $('sFolderPick').addEventListener('click', async () => {
   try {
@@ -1371,12 +1418,14 @@ $('sFolderPick').addEventListener('click', async () => {
 });
 $('sFolderAuto').addEventListener('change', () => store.device.set('folderAuto', $('sFolderAuto').checked));
 $('sFolderAll').addEventListener('click', async () => {
-  const handle = await store.kv.get('dirHandle');
-  if (!handle) return;
-  const jobs = (await store.listJobs()).filter(j => j.chunks?.some(c => c.raw));
-  let n = 0;
-  for (const j of jobs) if (await writeToFolder(j, handle, n === 0)) n++;
-  toast(`${n} ${n === 1 ? 'lezione salvata' : 'lezioni salvate'} in ${handle.name}`);
+  const jobs = (await store.listJobs()).filter(j => j.chunks?.some(c => c.raw) || j.edited);
+  let n = 0, first = true;
+  for (const j of jobs) {
+    const h = await folderFor(j);
+    if (h && await writeToFolder(j, h, first)) n++;
+    first = false;
+  }
+  toast(`${n} ${n === 1 ? 'lezione salvata' : 'lezioni salvate'} nelle cartelle dei corsi`);
 });
 
 async function renderStorage() {
@@ -1419,7 +1468,22 @@ async function start() {
     ? 'Oppure trascina qui un file audio' : 'Oppure condividila dal Registratore';
 
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw.js').catch(e => console.warn('Service worker non registrato', e));
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' })
+      .then(reg => reg.update())
+      .catch(e => console.warn('Service worker non registrato', e));
+    // Nuova versione dell'app installata: si ricarica da sola, ma mai a elaborazione in corso.
+    let reloading = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!hadController || reloading) return;
+      if (state.runner) {
+        notice('È disponibile una nuova versione di Sbobina. <button type="button" id="reloadApp">Ricarica</button> quando la trascrizione in corso è finita.');
+        $('reloadApp')?.addEventListener('click', () => location.reload());
+        return;
+      }
+      reloading = true;
+      location.reload();
+    });
     navigator.serviceWorker.addEventListener('message', e => { if (e.data?.type === 'inbox') checkInbox(); });
   }
   try { await navigator.storage?.persist?.(); } catch { /* facoltativo */ }

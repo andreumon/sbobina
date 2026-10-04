@@ -3,7 +3,7 @@
 //  - tiene in cache i file dell'app, così si apre anche senza rete;
 //  - apre la lezione quando tocchi la notifica "Sbobina pronta".
 
-const VERSION = 'sbobina-v5';
+const VERSION = 'sbobina-v7';
 const SHELL = [
   './', './index.html', './css/app.css', './manifest.webmanifest',
   './js/app.js', './js/aac.js', './js/config.js', './js/defaults.js', './js/db.js', './js/drive.js', './js/gemini.js',
@@ -66,10 +66,11 @@ self.addEventListener('fetch', event => {
     return;
   }
   if (req.method !== 'GET' || url.origin !== location.origin) return;
-  // Rete prima (aggiornamenti immediati), cache se offline.
+  // Rete prima (aggiornamenti immediati), cache se offline. "no-cache" obbliga a chiedere
+  // al server se il file è cambiato, ignorando i 10 minuti di cache di GitHub Pages.
   event.respondWith((async () => {
     try {
-      const res = await fetch(req);
+      const res = await fetch(req, { cache: 'no-cache' });
       if (res.ok) {
         const copy = res.clone();
         caches.open(VERSION).then(c => c.put(req, copy));

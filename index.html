@@ -116,6 +116,15 @@
             <textarea id="courseKeywords" rows="6" placeholder="regressione logistica, odds ratio, network analysis, centralità, …"></textarea>
             <p class="help">Termini tecnici, nomi propri e sigle del corso, separati da virgole. Aiutano il modello a riconoscerli e valgono per tutte le lezioni del corso, anche quelle ancora da trascrivere.</p>
           </div>
+          <div class="field" id="courseFolder" hidden>
+            <label>Cartella sul PC</label>
+            <p class="drive-state" id="courseFolderState"></p>
+            <div class="row">
+              <button type="button" id="courseFolderPick">Scegli cartella</button>
+              <button type="button" class="quiet" id="courseFolderClear" hidden>Usa la cartella generale</button>
+            </div>
+            <p class="help">Vale solo su questo PC (Chrome o Edge). Con il salvataggio automatico attivo nelle impostazioni, ogni lezione completata del corso finisce qui.</p>
+          </div>
           <div class="form-actions">
             <button type="submit" class="primary" id="courseSave">Salva corso</button>
             <label class="quiet-btn" id="courseAddRec" hidden>Aggiungi registrazione
@@ -278,7 +287,7 @@
           </fieldset>
 
           <fieldset id="sFolderSet" hidden>
-            <legend>Cartella sul PC</legend>
+            <legend>Cartella generale sul PC</legend>
             <p class="drive-state" id="sFolderState"></p>
             <div class="row">
               <button type="button" id="sFolderPick">Scegli cartella</button>

@@ -72,7 +72,7 @@ Serve perché il tuo sito possa leggere e scrivere i file di Sbobina nel tuo Dri
 1. Apri lo stesso indirizzo.
 2. Premi l'icona *Installa* nella barra degli indirizzi.
 3. Premi la nuvoletta in alto per collegare Drive: impostazioni e lezioni arrivano da sole.
-4. In *Impostazioni → Cartella sul PC* scegli dove salvare automaticamente i `.md` (solo Chrome ed Edge).
+4. In *Impostazioni → Cartella generale sul PC* scegli dove salvare i `.md` (solo Chrome ed Edge). Ogni corso può avere una cartella propria: pagina del corso → *Cartella sul PC*. Le lezioni di un corso senza cartella propria vanno in quella generale.
 5. In alternativa, con **Google Drive per desktop** la cartella `Sbobina` diventa una cartella vera del PC, sempre aggiornata. Dall'app, *Apri su Drive* apre il `.md` di una lezione o la cartella di un corso.
 
 ## Uso quotidiano
