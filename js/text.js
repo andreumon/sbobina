@@ -149,3 +149,28 @@ export function glossaryTerms(glossary) {
     .filter(s => s && s.length <= 100 && !seen.has(s.toLowerCase()) && seen.add(s.toLowerCase()))
     .slice(0, 300);
 }
+
+/**
+ * Cerca possibili parti mancanti nella revisione: intervalli tra due paragrafi molto più
+ * lunghi di quanto servirebbe a pronunciare il primo (circa 150 parole al minuto), e un
+ * finale di blocco senza testo. Restituisce frasi da mostrare all'utente.
+ */
+export function coverageWarnings(paragraphs, start, end, lectureDuration = end) {
+  const timed = paragraphs.filter(p => p.t !== null && p.t !== undefined);
+  if (timed.length < 2) return [];
+  const long = lectureDuration >= 3600;
+  const ts = t => `[${fmtTime(t, long || t >= 3600)}]`;
+  const out = [];
+  for (let k = 0; k < timed.length - 1; k++) {
+    const a = timed[k], b = timed[k + 1];
+    const spoken = countWords(a.text) / 2.5; // secondi stimati per dirlo
+    const gap = b.t - a.t;
+    if (gap > Math.max(100, spoken * 2 + 45)) out.push(`tra ${ts(a.t)} e ${ts(b.t)} (${String(Math.round((gap - spoken) / 6) / 10).replace('.', ',')} min senza testo)`);
+  }
+  const last = timed[timed.length - 1];
+  const tail = end - last.t - countWords(last.text) / 2.5;
+  if (tail > 120) out.push(`dopo ${ts(last.t)} fino alla fine del blocco (${String(Math.round(tail / 6) / 10).replace('.', ',')} min)`);
+  if (!out.length) return [];
+  const shown = out.length > 3 ? [...out.slice(0, 3), `e altri ${out.length - 3} intervalli`] : out;
+  return [`Possibili parti non trascritte: ${shown.join('; ')}. Potrebbero essere pause o silenzi: ascolta per verificare.`];
+}

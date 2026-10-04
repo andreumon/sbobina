@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Sbobina</title>
   <meta name="description" content="Trascrizione letterale delle lezioni universitarie, con revisione e riascolto.">
-  <meta name="theme-color" content="#f6f5f0" media="(prefers-color-scheme: light)">
-  <meta name="theme-color" content="#1c2622" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f3f4f7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#181d26" media="(prefers-color-scheme: dark)">
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icons/icon-192.png">
   <link rel="apple-touch-icon" href="icons/icon-192.png">
@@ -107,6 +107,11 @@
             <input id="courseName" required placeholder="Social Data">
           </div>
           <div class="field">
+            <label for="courseLang">Lingua delle lezioni</label>
+            <select id="courseLang"></select>
+            <p class="help">Serve a riconoscere bene le parole e a non tradurre nulla: ogni frase resta nella lingua in cui è detta.</p>
+          </div>
+          <div class="field">
             <label for="courseKeywords">Parole chiave</label>
             <textarea id="courseKeywords" rows="6" placeholder="regressione logistica, odds ratio, network analysis, centralità, …"></textarea>
             <p class="help">Termini tecnici, nomi propri e sigle del corso, separati da virgole. Aiutano il modello a riconoscerli e valgono per tutte le lezioni del corso, anche quelle ancora da trascrivere.</p>
@@ -116,6 +121,7 @@
             <label class="quiet-btn" id="courseAddRec" hidden>Aggiungi registrazione
               <input type="file" id="courseFileInput" accept="audio/*,.aac,.m4a,.mp3,.wav,.ogg,.opus" multiple hidden>
             </label>
+            <button type="button" class="quiet" id="courseDrive" hidden>Apri cartella su Drive</button>
             <button type="button" class="quiet danger-text" id="courseDelete" hidden>Elimina corso</button>
           </div>
         </form>
@@ -138,6 +144,7 @@
           <button type="button" data-act="edit">Modifica</button>
           <button type="button" data-act="move">Sposta</button>
           <button type="button" data-act="rename">Rinomina</button>
+          <button type="button" data-act="drive" hidden>Apri su Drive</button>
           <button type="button" data-act="delete" class="danger">Elimina</button>
         </nav>
 
@@ -236,8 +243,12 @@
             <legend>Trascrizione</legend>
             <div class="field">
               <label for="sChunk">Durata dei blocchi: <output id="sChunkOut"></output> minuti</label>
-              <input id="sChunk" type="range" min="10" max="40" step="5">
-              <p class="help">La lezione viene tagliata nelle pause in blocchi di questa durata. Blocchi più corti rendono la revisione più fedele.</p>
+              <input id="sChunk" type="range" min="15" max="54" step="1">
+              <p class="help">La lezione viene tagliata nelle pause in blocchi di questa durata. Ogni blocco costa una richiesta di trascrizione e una di revisione: con le quote gratuite (circa 20 richieste al giorno per modello) blocchi lunghi permettono più lezioni al giorno.</p>
+            </div>
+            <div class="field">
+              <label for="sLang">Lingua delle lezioni senza corso</label>
+              <select id="sLang"></select>
             </div>
             <label class="check"><input type="checkbox" id="sRevise"> Revisione: punteggiatura, paragrafi, correzioni dal contesto</label>
             <label class="check"><input type="checkbox" id="sRelisten"> Durante la revisione il modello riascolta l'audio (serve per i tempi dei paragrafi)</label>
@@ -251,11 +262,14 @@
                 <label for="sRModel">Modello di revisione</label>
                 <input id="sRModel" spellcheck="false">
               </div>
-              <div class="field">
-                <label for="sLang">Lingua (codice BCP-47)</label>
-                <input id="sLang" spellcheck="false">
-              </div>
+
             </details>
+          </fieldset>
+
+          <fieldset>
+            <legend>Quote gratuite di oggi</legend>
+            <div id="sQuota" class="quota"></div>
+            <p class="help">Conteggio di questo dispositivo, dalle 9:00 di oggi. I numeri ufficiali sono in AI Studio, alla pagina dei limiti di frequenza.</p>
           </fieldset>
 
           <fieldset>

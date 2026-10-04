@@ -72,7 +72,8 @@ Serve perché il tuo sito possa leggere e scrivere i file di Sbobina nel tuo Dri
 1. Apri lo stesso indirizzo.
 2. Premi l'icona *Installa* nella barra degli indirizzi.
 3. Premi la nuvoletta in alto per collegare Drive: impostazioni e lezioni arrivano da sole.
-4. In *Impostazioni → Cartella sul PC* scegli dove salvare automaticamente i `.md`.
+4. In *Impostazioni → Cartella sul PC* scegli dove salvare automaticamente i `.md` (solo Chrome ed Edge).
+5. In alternativa, con **Google Drive per desktop** la cartella `Sbobina` diventa una cartella vera del PC, sempre aggiornata. Dall'app, *Apri su Drive* apre il `.md` di una lezione o la cartella di un corso.
 
 ## Uso quotidiano
 
@@ -91,7 +92,17 @@ Serve perché il tuo sito possa leggere e scrivere i file di Sbobina nel tuo Dri
 
 ## Limiti da sapere
 
-- **Quote gratuite**: il piano gratuito di Gemini ha limiti di richieste al minuto e al giorno, e Google li cambia nel tempo. Se li superi, Sbobina aspetta e riprova da sola. Se la quota del giorno è finita, la lezione resta *Interrotta* e premi *Riprendi* più tardi.
+- **Quote gratuite** (ottobre 2026, per progetto Google, azzerate alle 9:00 italiane):
+
+  | Modello | Richieste/min | Token/min | Richieste/giorno |
+  | --- | --- | --- | --- |
+  | gemini-3.5-transcribe | 3 | 10.000 | 25 |
+  | gemini-3.8-flash | 5 | 250.000 | 20 |
+  | gemini-3.7-flash | 5 | 250.000 | 20 |
+
+  Sbobina tiene il conto, aspetta il tempo giusto tra una richiesta e l'altra e, se un modello va atteso a lungo o ha finito la quota del giorno, passa al successivo (3.8 → 3.7 → 3.6 → 3.5 → flash-lite) senza ritentarlo nei blocchi seguenti. Con blocchi da 45 minuti una lezione costa circa 4 richieste. Se finiscono tutte le quote, la lezione va *in attesa* e riparte da sola alle 9:00, con l'app aperta. In *Impostazioni → Quote gratuite di oggi* vedi il conteggio.
+- **Lingua**: si imposta per corso (italiano, inglese, inglese con parti in italiano…). Il modello non traduce mai: ogni frase resta nella lingua in cui è detta.
+- **Controllo dei buchi**: se tra due paragrafi passa molto più tempo di quanto serva a pronunciarli, Sbobina lo segnala sopra il testo con i tempi cliccabili. Spesso sono pause o silenzi, a volte testo saltato: un tocco e ascolti.
 - **Privacy**: nel piano gratuito Google può usare i contenuti inviati per migliorare i suoi modelli. Per le lezioni di solito non è un problema. Non usarlo per registrazioni riservate.
 - **Tempi dei paragrafi**: li stima il modello mentre riascolta, con una precisione di qualche secondo. I tagli tra i blocchi invece sono esatti.
 - **Formati**: l'AAC del registratore viene tagliato senza perdite. Altri formati (`.m4a`, `.mp3`, `.ogg`…) funzionano: sotto i 55 minuti vanno in un blocco unico, oltre vengono trascritti a tratti di tempo.
@@ -101,12 +112,14 @@ Serve perché il tuo sito possa leggere e scrivere i file di Sbobina nel tuo Dri
 
 | File | Cosa fa |
 | --- | --- |
-| `index.html`, `css/app.css` | Interfaccia: tema chiaro "carta" e scuro "lavagna" |
+| `index.html`, `css/app.css` | Interfaccia: tema chiaro e scuro ardesia |
 | `js/app.js` | Schermate, lettore, impostazioni, coda di elaborazione |
 | `js/aac.js` | Analisi dei frame AAC e taglio nelle pause |
 | `js/pipeline.js` | Blocchi → caricamento → trascrizione → revisione, con ripresa |
 | `js/prompts.js` | Istruzioni ai modelli (modificabili) |
-| `js/gemini.js` | Gemini API: Files API e Interactions API, con nuovi tentativi |
+| `js/gemini.js` | Gemini API: Files API e Interactions API |
+| `js/quota.js` | Conteggio e dosatura delle quote gratuite, scelta del modello |
+| `js/config.js` | ID client di Google Drive (il tuo: non sovrascriverlo negli aggiornamenti) |
 | `js/drive.js`, `js/sync.js` | Login Google e sincronizzazione con Drive |
 | `js/text.js` | Tempi, paragrafi, controllo di completezza, Markdown |
 | `sw.js`, `manifest.webmanifest` | App installabile, ricezione dei file condivisi, uso offline |

@@ -10,8 +10,10 @@ import { Gemini, explainError } from './gemini.js';
 import { guessMime, cleanForPlayback } from './aac.js';
 import { diagnose, describeStrategy, saveStrategy, resetStrategy, loadStrategy } from './strategy.js';
 import {
-  fmtTime, lectureParagraphs, toMarkdown, safeFileName, countUncertain, toEditable, parseEditable,
+  fmtTime, lectureParagraphs, toMarkdown, safeFileName, countUncertain, toEditable, parseEditable, parseTime,
 } from './text.js';
+import { LANGS } from './prompts.js';
+import * as quota from './quota.js';
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -92,7 +94,7 @@ function applyTheme(t = store.device.get('theme', 'auto')) {
   $('themeBtn').querySelector('use').setAttribute('href', dark ? '#i-sun' : '#i-moon');
   $('themeBtn').setAttribute('aria-label', dark ? 'Passa al tema chiaro' : 'Passa al tema scuro');
   const meta = document.querySelectorAll('meta[name="theme-color"]');
-  meta.forEach(m => { if (t !== 'auto') m.setAttribute('content', dark ? '#1c2622' : '#f4f5f1'); });
+  meta.forEach(m => { if (t !== 'auto') m.setAttribute('content', dark ? '#181d26' : '#f3f4f7'); });
 }
 $('themeBtn').addEventListener('click', () => {
   const dark = document.documentElement.dataset.theme === 'dark' ||
@@ -114,7 +116,7 @@ function stateLabel(job) {
     case 'running':
       return job.runner === store.deviceId ? { text: 'In coda', cls: '' } : { text: 'In elaborazione su un altro dispositivo', cls: '' };
     case 'paused': return { text: 'In pausa', cls: '' };
-    case 'waiting': return { text: 'In attesa: Google è sovraccarico', cls: '' };
+    case 'waiting': return { text: job.waitDaily ? 'In attesa della quota di domani' : 'In attesa: Google è sovraccarico', cls: '' };
     case 'error': return { text: 'Interrotta', cls: 'err' };
     default: return null;
   }
@@ -209,6 +211,8 @@ const refreshList = () => { clearTimeout(listTimer); listTimer = setTimeout(rend
 // Corsi (cartelle)
 // ====================================================================
 
+const langOptions = sel => Object.entries(LANGS).map(([k, v]) => `<option value="${k}"${k === sel ? ' selected' : ''}>${esc(v.label)}</option>`).join('');
+
 async function openCourse(name, { push = true } = {}) {
   const course = name ? settings.courses.find(c => c.name === name) || { name, glossary: '' } : null;
   state.courseName = name || null;
@@ -218,6 +222,8 @@ async function openCourse(name, { push = true } = {}) {
   $('courseHeading').textContent = course ? course.name : 'Nuovo corso';
   $('courseName').value = course?.name || '';
   $('courseKeywords').value = course?.glossary || '';
+  $('courseLang').innerHTML = langOptions(course?.lang || 'it');
+  $('courseDrive').hidden = !course || !drive.configured;
   $('courseSave').textContent = course ? 'Salva modifiche' : 'Crea corso';
   $('courseDelete').hidden = !course;
   $('courseAddRec').hidden = !course;
@@ -237,6 +243,7 @@ $('courseForm').addEventListener('submit', async e => {
   e.preventDefault();
   const name = $('courseName').value.trim().replace(/[\\/]+/g, '-');
   const glossary = $('courseKeywords').value.trim();
+  const lang = $('courseLang').value;
   if (!name) return;
   const oldName = state.courseName;
   if (name !== oldName && settings.courses.some(c => c.name === name)) {
@@ -244,7 +251,7 @@ $('courseForm').addEventListener('submit', async e => {
     return;
   }
   const courses = settings.courses.filter(c => c.name !== oldName);
-  courses.push({ name, glossary });
+  courses.push({ ...(settings.courses.find(c => c.name === oldName) || {}), name, glossary, lang });
   courses.sort((a, b) => a.name.localeCompare(b.name, 'it'));
   settings = store.saveSettings({ courses });
   if (oldName && oldName !== name) {
@@ -278,6 +285,16 @@ $('courseDelete').addEventListener('click', async () => {
     await sync.run();
     drive.trashCourseFolderIfEmpty(name).catch(() => {});
   }
+});
+
+$('courseDrive').addEventListener('click', async () => {
+  const name = state.courseName;
+  const win = window.open('about:blank', '_blank');
+  try {
+    if (!drive.connected) await drive.connect();
+    const id = await drive.courseFolder(name);
+    if (win) win.location = `https://drive.google.com/drive/folders/${id}`; else location.href = `https://drive.google.com/drive/folders/${id}`;
+  } catch (e) { win?.close(); toast(`Drive: ${e.message}`, 4000); }
 });
 
 $('courseFileInput').addEventListener('change', e => {
@@ -526,8 +543,9 @@ async function runQueue() {
       if (!paused) console.error(e);
       await store.updateJob(job.id, j => {
         j.status = paused ? 'paused' : busy ? 'waiting' : 'error';
-        j.error = paused ? null : explainError(busy ? e.cause : e);
-        j.retryAt = busy ? Date.now() + e.retryAfterMs : null;
+        j.error = paused ? null : busy ? e.message : explainError(e);
+        j.retryAt = busy ? e.retryAt : null;
+        j.waitDaily = busy ? !!e.daily : false;
         if (busy) j.runner = store.deviceId; else delete j.runner;
       });
       if (busy) scheduleWakeups();
@@ -554,10 +572,14 @@ function progressText(job, p) {
   switch (p.step) {
     case 'fetch': return `Recupero l'audio da Drive… ${Math.round((p.progress || 0) * 100)}%`;
     case 'plan': return 'Analizzo l\'audio e cerco le pause…';
+    case 'quota': {
+      const left = Math.max(0, Math.round(((p.until || 0) - Date.now()) / 1000));
+      return `${part}rispetto i limiti gratuiti di Google, riprendo tra ${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
+    }
     case 'diagnose': return `Google ha rifiutato la richiesta: provo alcune varianti${p.label ? ` (${p.label})` : ''}…`;
     case 'upload': return `${part}invio a Gemini ${Math.round((p.progress || 0) * 100)}%`;
-    case 'transcribe': return `${part}trascrizione letterale…`;
-    case 'revise': return `${part}revisione e controllo…`;
+    case 'transcribe': return `${part}trascrizione letterale${p.model ? ` con ${p.model}` : ''}…`;
+    case 'revise': return `${part}revisione e controllo${p.model ? ` con ${p.model}` : ''}…`;
     case 'done': return 'Completata';
     default: return 'In elaborazione…';
   }
@@ -623,11 +645,17 @@ async function renderLecture(job) {
   const driveNote = up && !up.done ? `, copia su Drive ${Math.round(up.progress * 100)}%` : '';
   $('lecMeta').textContent = lectureMeta(job) + driveNote;
   $('lecActions').querySelector('[data-act="share"]').hidden = !navigator.share;
+  $('lecActions').querySelector('[data-act="drive"]').hidden = !(job.remote?.mdId || job.remote?.audioId);
   if (job.duration && Math.abs(job.duration - player.duration) > 1) player.setDuration(job.duration);
 
   renderStatus(job);
 
-  const warns = (job.chunks || []).map((c, i) => c.warn ? `<p>Blocco ${i + 1} (${fmtTime(c.start)}–${fmtTime(c.end)}): ${esc(c.warn)}</p>` : '').join('');
+  const long = (job.duration || 0) >= 3600;
+  const linkTimes = t => esc(t).replace(/\[(\d{1,3}:\d{2}(?::\d{2})?)\]/g, (m, x) => {
+    const sec = parseTime(x);
+    return sec === null ? m : `<button type="button" class="ts" data-t="${sec}">${x}</button>`;
+  });
+  const warns = (job.chunks || []).map((c, i) => c.warn ? `<p>Blocco ${i + 1} (${fmtTime(c.start, long)}–${fmtTime(c.end, long)}): ${linkTimes(c.warn)}</p>` : '').join('');
   $('lecChecks').innerHTML = warns;
   $('lecChecks').hidden = !warns || state.tab !== 'revised' || !!job.edited;
 
@@ -663,7 +691,10 @@ function renderStatus(job) {
       actions = '<button type="button" class="btn" data-run="resume">Riprendi</button>';
     } else if (job.status === 'waiting') {
       const at = new Date(job.retryAt || Date.now()).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
-      text = `Google è sovraccarico o ha esaurito la quota gratuita per ora. Riprovo da solo alle ${at}, con l'app aperta.`;
+      const tomorrow = new Date(job.retryAt || 0).toDateString() !== new Date().toDateString();
+      text = job.waitDaily
+        ? `Quota gratuita di oggi esaurita su tutti i modelli. Riprendo da solo ${tomorrow ? 'domani ' : ''}alle ${at}, con l'app aperta.`
+        : `Google è sovraccarico. Riprovo da solo alle ${at}, con l'app aperta.`;
       actions = '<button type="button" class="btn" data-run="resume">Riprova ora</button>';
     } else if (job.status === 'paused') {
       text = 'Elaborazione in pausa.';
@@ -755,7 +786,7 @@ function renderTranscript(job) {
   ub.textContent = `${unsure.length} ${unsure.length === 1 ? 'punto' : 'punti'} da verificare`;
   state.unsureCursor = -1;
   highlightNow(player.currentTime);
-  if (/\$[^$\n]+\$/.test(art.textContent)) renderMath(art);
+  if (/\$[^$]+\$/.test(art.textContent)) renderMath(art);
 }
 
 $('uncertainBtn').addEventListener('click', () => {
@@ -766,6 +797,11 @@ $('uncertainBtn').addEventListener('click', () => {
   el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   el?.classList.remove('flash'); void el?.offsetWidth; el?.classList.add('flash');
   $('uncertainBtn').textContent = `${state.unsureCursor + 1} di ${state.unsure.length} da verificare`;
+});
+
+$('lecChecks').addEventListener('click', e => {
+  const ts = e.target.closest('.ts');
+  if (ts) player.seek(Number(ts.dataset.t), true);
 });
 
 $('transcript').addEventListener('click', e => {
@@ -807,7 +843,7 @@ function renderMath(el) {
     }).catch(() => { katexReady = null; });
   }
   katexReady?.then(() => {
-    try { window.renderMathInElement?.(el, { delimiters: [{ left: '$', right: '$', display: false }], throwOnError: false }); } catch { /* lascia il testo com'è */ }
+    try { window.renderMathInElement?.(el, { delimiters: [{ left: '$$', right: '$$', display: true }, { left: '$', right: '$', display: false }], throwOnError: false }); } catch { /* lascia il testo com'è */ }
   });
 }
 
@@ -856,6 +892,12 @@ async function lectureAction(act, id, from = 'menu') {
     case 'open':
       openLecture(id);
       break;
+    case 'drive': {
+      const fid = job.remote?.mdId || job.remote?.audioId;
+      if (!fid) { toast('Questa lezione non è ancora su Drive.'); break; }
+      window.open(`https://drive.google.com/file/d/${fid}/view`, '_blank', 'noopener');
+      break;
+    }
     case 'copy':
       try { await navigator.clipboard.writeText(md); toast('Testo copiato'); } catch { toast('Copia non riuscita'); }
       break;
@@ -967,6 +1009,7 @@ async function openLectureMenu(id, pos = {}) {
     ['rename', 'Rinomina'],
     ['move', 'Sposta in un altro corso'],
     ...(hasText ? [['edit', 'Modifica testo'], ['copy', 'Copia testo'], ['save', 'Salva .md'], ...(navigator.share ? [['share', 'Condividi']] : [])] : []),
+    ...(job.remote?.mdId || job.remote?.audioId ? [['drive', 'Apri su Drive']] : []),
     ['delete', 'Elimina'],
   ];
   if ('vibrate' in navigator && pos.x === undefined) navigator.vibrate?.(12);
@@ -1191,7 +1234,8 @@ function renderSettings() {
   $('sRelisten').disabled = !settings.revise;
   $('sTModel').value = settings.transcribeModel;
   $('sRModel').value = settings.reviseModel;
-  $('sLang').value = settings.language;
+  $('sLang').innerHTML = langOptions(settings.defaultLang || 'it');
+  renderQuota();
   $('sTheme').value = store.device.get('theme', 'auto');
   $('sClient').value = store.device.get('clientId', '');
   $('sClientField').hidden = !!DRIVE_CLIENT_ID;
@@ -1263,7 +1307,16 @@ $('sRevise').addEventListener('change', () => { saveSetting({ revise: $('sRevise
 $('sRelisten').addEventListener('change', () => saveSetting({ relisten: $('sRelisten').checked }));
 $('sTModel').addEventListener('change', () => saveSetting({ transcribeModel: $('sTModel').value.trim() }));
 $('sRModel').addEventListener('change', () => saveSetting({ reviseModel: $('sRModel').value.trim() }));
-$('sLang').addEventListener('change', () => saveSetting({ language: $('sLang').value.trim() }));
+$('sLang').addEventListener('change', () => saveSetting({ defaultLang: $('sLang').value }));
+
+function renderQuota() {
+  const rows = quota.summary().filter(r => r.used || r.rpd);
+  const t = Date.now();
+  $('sQuota').innerHTML = rows.map(r => {
+    const state = r.exhausted ? 'esaurita fino alle 9:00' : r.cooldownUntil > t ? 'in pausa per qualche minuto' : '';
+    return `<p><span>${esc(r.model)}</span><span>${r.used}${r.rpd ? ` / ${r.rpd}` : ''} richieste${state ? `, ${state}` : ''}</span></p>`;
+  }).join('') || '<p>Nessuna richiesta oggi.</p>';
+}
 $('sTheme').addEventListener('change', () => { store.device.set('theme', $('sTheme').value); applyTheme(); });
 $('sClient').addEventListener('change', () => {
   store.device.set('clientId', $('sClient').value.trim());

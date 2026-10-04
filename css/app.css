@@ -1,17 +1,17 @@
-/* Sbobina: carta e inchiostro di giorno, lavagna e gesso di notte. */
+/* Sbobina: carta e inchiostro di giorno, ardesia e gesso di notte. */
 
 :root {
-  --bg: #f4f5f1;
-  --surface: #fbfcf9;
-  --ink: #1e2925;
-  --muted: #5f6a65;
-  --faint: #8b948f;
-  --line: #dadfd9;
+  --bg: #f3f4f7;
+  --surface: #fbfbfd;
+  --ink: #1b2230;
+  --muted: #5b6475;
+  --faint: #8a92a1;
+  --line: #d8dce4;
   --accent: #8f6300;           /* ocra: tempi, punti da verificare, posizione */
   --accent-soft: rgba(176, 125, 10, 0.13);
   --now: rgba(176, 125, 10, 0.08);
   --danger: #a33a2a;
-  --focus: #2f6f5a;
+  --focus: #3b5f9e;
   --shadow: 0 -1px 0 var(--line);
   --sans: 'Instrument Sans', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   --serif: 'Literata', Georgia, 'Times New Roman', serif;
@@ -22,32 +22,32 @@
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #1c2622;
-    --surface: #222e29;
-    --ink: #e8ebe4;
-    --muted: #a3ada7;
-    --faint: #7b8781;
-    --line: #34423c;
+    --bg: #181d26;
+    --surface: #1f2531;
+    --ink: #e6e9ef;
+    --muted: #a0a8b6;
+    --faint: #737c8c;
+    --line: #2d3442;
     --accent: #e8c872;          /* gesso giallo */
     --accent-soft: rgba(232, 200, 114, 0.16);
     --now: rgba(232, 200, 114, 0.075);
     --danger: #e98c7a;
-    --focus: #9fd3bd;
+    --focus: #9dbcf0;
     color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
-  --bg: #1c2622;
-  --surface: #222e29;
-  --ink: #e8ebe4;
-  --muted: #a3ada7;
-  --faint: #7b8781;
-  --line: #34423c;
+  --bg: #181d26;
+  --surface: #1f2531;
+  --ink: #e6e9ef;
+  --muted: #a0a8b6;
+  --faint: #737c8c;
+  --line: #2d3442;
   --accent: #e8c872;
   --accent-soft: rgba(232, 200, 114, 0.16);
   --now: rgba(232, 200, 114, 0.075);
   --danger: #e98c7a;
-  --focus: #9fd3bd;
+  --focus: #9dbcf0;
   color-scheme: dark;
 }
 
@@ -404,7 +404,7 @@ button.quiet:hover { color: var(--ink); text-decoration-color: var(--accent); }
   li:hover > .row-more, .row-more:focus-visible { opacity: 1; pointer-events: auto; }
   .row-more:hover { background: var(--accent-soft); color: var(--ink); }
 }
-.sheet-backdrop { position: fixed; inset: 0; z-index: 40; background: rgba(10, 16, 14, 0.38); }
+.sheet-backdrop { position: fixed; inset: 0; z-index: 40; background: rgba(8, 11, 18, 0.42); }
 .sheet {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 41; background: var(--surface);
   border-radius: 14px 14px 0 0; padding: 8px 0 max(12px, env(safe-area-inset-bottom));
@@ -430,3 +430,8 @@ button.quiet:hover { color: var(--ink); text-decoration-color: var(--accent); }
 .sheet-form label { display: block; font-size: 0.9rem; font-weight: 500; margin-bottom: 6px; }
 .sheet.popover .sheet-form { padding: 6px 14px; }
 .sheet-backdrop.clear { background: transparent; }
+
+.quota p { display: flex; justify-content: space-between; gap: 12px; margin: 0; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 0.92rem; font-variant-numeric: tabular-nums; }
+.quota p span:first-child { color: var(--muted); }
+.checks .ts { position: static; width: auto; padding: 0 2px; vertical-align: baseline; font-size: 0.85rem; }
+.transcript .katex-display { margin: 0.6em 0; overflow-x: auto; overflow-y: hidden; }

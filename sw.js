@@ -3,11 +3,11 @@
 //  - tiene in cache i file dell'app, così si apre anche senza rete;
 //  - apre la lezione quando tocchi la notifica "Sbobina pronta".
 
-const VERSION = 'sbobina-v4';
+const VERSION = 'sbobina-v5';
 const SHELL = [
   './', './index.html', './css/app.css', './manifest.webmanifest',
-  './js/app.js', './js/aac.js', './js/config.js', './js/db.js', './js/drive.js', './js/gemini.js',
-  './js/pipeline.js', './js/player.js', './js/prompts.js', './js/store.js', './js/strategy.js', './js/sync.js', './js/text.js',
+  './js/app.js', './js/aac.js', './js/config.js', './js/defaults.js', './js/db.js', './js/drive.js', './js/gemini.js',
+  './js/pipeline.js', './js/player.js', './js/prompts.js', './js/quota.js', './js/store.js', './js/strategy.js', './js/sync.js', './js/text.js',
   './icons/icon-192.png', './icons/icon-512.png',
 ];
 

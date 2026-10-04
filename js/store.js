@@ -1,6 +1,6 @@
 // Lezioni e impostazioni salvate su questo dispositivo, più un piccolo "bus" di eventi.
 import * as db from './db.js';
-import { DEFAULTS } from './config.js';
+import { DEFAULTS } from './defaults.js';
 
 export const bus = new EventTarget();
 export const emit = (type, detail) => bus.dispatchEvent(new CustomEvent(type, { detail }));
@@ -58,7 +58,10 @@ const SETTINGS_KEY = 'sbobina.settings';
 export function loadSettings() {
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}'); } catch { /* ignora */ }
-  return { ...DEFAULTS, ...saved, courses: Array.isArray(saved.courses) ? saved.courses : [] };
+  const out = { ...DEFAULTS, ...saved, courses: Array.isArray(saved.courses) ? saved.courses : [] };
+  // Blocchi da 20 minuti erano il vecchio valore predefinito: con le quote gratuite conviene 45.
+  if (!saved.chunkV2) { if (!saved.chunkMin || saved.chunkMin === 20) out.chunkMin = 45; out.chunkV2 = true; }
+  return out;
 }
 
 export function saveSettings(patch, { fromRemote = false } = {}) {

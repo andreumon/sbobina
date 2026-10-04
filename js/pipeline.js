@@ -6,24 +6,37 @@
 // della lezione (vedi strategy.js) e l'elaborazione riprende con la variante che funziona.
 import * as store from './store.js';
 import { analyzeAdts, planChunks, probeDuration, sliceParts } from './aac.js';
-import { Gemini, ApiError, blobToBase64, isTransient } from './gemini.js';
-import { transcriptionPrompt, revisionPrompt, continuationPrompt } from './prompts.js';
-import { paragraphsFromChunk, paragraphsFromRaw, completenessCheck, glossaryTerms, fmtTime, countWords } from './text.js';
+import { Gemini, ApiError, blobToBase64 } from './gemini.js';
+import { transcriptionPrompt, revisionPrompt, continuationPrompt, langOf } from './prompts.js';
+import * as quota from './quota.js';
+import { paragraphsFromChunk, paragraphsFromRaw, completenessCheck, glossaryTerms, fmtTime, countWords, coverageWarnings } from './text.js';
 import {
   loadStrategy, saveStrategy, diagnose, describeStrategy, maxChunkSec, toWav16k, isRequestShapeError, INLINE_MAX_BYTES,
 } from './strategy.js';
 
 const GEMINI_FILE_TTL = 46 * 3600 * 1000; // Google li tiene 48 ore
 const MAX_REQUEST_SEC = 54 * 60;           // limite del modello di trascrizione: 1 ora
-const PLAN_VERSION = 2;
-// Modelli gratuiti di riserva, provati in ordine quando quello scelto è sovraccarico.
-export const FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash'];
-const REVISE_CONFIG = { maxOutputTokens: 32768, thinkingLevel: 'low' };
+const PLAN_VERSION = 2;                    // 2: esclude il frame finto iniziale del registratore
+// Modelli gratuiti, provati in ordine quando quello scelto è sovraccarico o ha finito la quota.
+// I "lite" hanno quote giornaliere molto più alte: sono l'ultima riserva.
+export const FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
+const GEN_CONFIG = { maxOutputTokens: 32768, thinkingLevel: 'low' };
+const MAX_INLINE_WAIT = 6 * 60_000;        // oltre questa attesa la lezione va "in attesa" e libera la coda
+const SWITCH_IF_WAIT = 2 * 60_000;         // se un modello va atteso più di così, si preferisce un altro libero
 
-/** Google è sovraccarico su tutti i modelli: la lezione va rimessa in coda più tardi. */
+/** Nessun modello disponibile adesso: la lezione si rimette in coda all'ora indicata. */
 export class BusyError extends Error {
-  constructor(cause) { super(cause.message); this.cause = cause; this.retryAfterMs = cause.status === 429 ? 15 * 60_000 : 8 * 60_000; }
-}                    // 2: esclude il frame finto iniziale del registratore
+  constructor(message, retryAt, daily = false) {
+    super(message);
+    this.retryAt = retryAt;
+    this.daily = daily;
+  }
+}
+
+const sleep = (ms, signal) => new Promise((resolve, reject) => {
+  const t = setTimeout(resolve, ms);
+  signal?.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('Interrotto', 'AbortError')); }, { once: true });
+});
 
 function stripFences(t) {
   return String(t || '').replace(/^\s*```[a-z]*\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
@@ -60,7 +73,7 @@ export async function processJob(id, ctx) {
   // ---- 1. Pianificazione dei blocchi
   const plan = async () => {
     progress({ step: 'plan' });
-    let chunkSec = Math.min(40, Math.max(10, Number(settings.chunkMin) || 20)) * 60;
+    let chunkSec = Math.min(54, Math.max(10, Number(settings.chunkMin) || 45)) * 60;
     let chunks, duration;
     const bytes = new Uint8Array(await audio.arrayBuffer());
     const info = analyzeAdts(bytes);
@@ -99,6 +112,7 @@ export async function processJob(id, ctx) {
   const courseCfg = (settings.courses || []).find(c => c.name === job.course);
   const vocabulary = glossaryTerms(courseCfg ? courseCfg.glossary : job.glossary);
   const glossaryText = vocabulary.join(', ');
+  const lang = langOf(courseCfg?.lang || job.lang || settings.defaultLang || 'it');
 
   // ---- Audio da inviare per un blocco, nella forma richiesta dalla strategia
   const wavCache = new Map();
@@ -140,28 +154,81 @@ export async function processJob(id, ctx) {
     return { uri: f.uri, mimeType: mime }; // tipo canonico, non quello restituito dal server
   };
 
-  // ---- Modelli di riserva: se quello scelto è sovraccarico (503) o ha finito la quota (429)
+  // ---- Dosatore: sceglie il modello, rispetta le quote, ricorda chi è esaurito o sovraccarico
   const chain = [settings.reviseModel, ...FALLBACK_MODELS.filter(m => m !== settings.reviseModel)];
-  const unavailable = new Set();
-  const withModels = async (label, fn) => {
-    let lastErr;
-    for (const model of chain) {
-      if (unavailable.has(model)) continue;
-      try {
-        const text = await fn(model);
-        return { text, model };
-      } catch (e) {
-        if (e.name === 'AbortError') throw e;
-        if (isTransient(e)) {
-          lastErr = e;
-          await log(`${label}: ${model} non disponibile (${e.status === 429 ? 'quota esaurita' : 'sovraccarico'}), provo il modello successivo`);
+  const missing = new Set(); // modelli che non esistono per questa chiave (404)
+  const waitFor = async (ms, info) => {
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+      progress({ ...info, step: 'quota', until });
+      await sleep(Math.min(5000, until - Date.now()), signal);
+    }
+  };
+  /**
+   * candidates: [{ model, kind: 'transcribe' | 'generate' }], in ordine di preferenza.
+   * call(candidate) esegue la richiesta. Ritorna { text, model }.
+   */
+  const runStep = async ({ label, candidates, tokens, call, info }) => {
+    const minuteHits = new Map();
+    for (;;) {
+      if (signal?.aborted) throw new DOMException('Interrotto', 'AbortError');
+      const alive = candidates.filter(c => !missing.has(c.model) && (minuteHits.get(c.model) || 0) < 2);
+      if (!alive.length) throw new ApiError(`${label}: nessun modello utilizzabile.`, 503);
+      const ready = alive.filter(c => quota.usable(c.model));
+      if (!ready.length) {
+        const at = Math.min(...alive.map(c => quota.availableAt(c.model)));
+        const wait = at - Date.now();
+        if (wait <= MAX_INLINE_WAIT) {
+          await log(`${label}: tutti i modelli in pausa, riprovo tra ${Math.ceil(wait / 1000)} s`);
+          await waitFor(wait, info);
           continue;
         }
-        if (e instanceof ApiError && e.status === 404 && model !== settings.reviseModel) { unavailable.add(model); continue; }
+        const daily = at >= quota.quotaDay().resetAt - 120_000;
+        throw new BusyError(daily
+          ? 'Quota gratuita giornaliera esaurita su tutti i modelli disponibili.'
+          : 'Google è sovraccarico su tutti i modelli disponibili.', at, daily);
+      }
+      let pick = ready[0];
+      let wait = quota.waitBefore(pick.model, tokens);
+      if (wait > SWITCH_IF_WAIT) {
+        for (const c of ready.slice(1)) {
+          const w = quota.waitBefore(c.model, tokens);
+          if (w < wait) { pick = c; wait = w; }
+          if (w === 0) break;
+        }
+      }
+      if (wait > 0) {
+        await log(`${label}: attendo ${Math.ceil(wait / 1000)} s per restare nel limite al minuto di ${pick.model}`);
+        await waitFor(wait, info);
+      }
+      try {
+        const text = await call(pick);
+        quota.record(pick.model, tokens);
+        return { text, model: pick.model };
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+        const c = quota.onError(pick.model, e);
+        if (c.kind === 'daily') { await log(`${label}: ${pick.model} ha finito la quota gratuita di oggi (si azzera alle 9:00)`); continue; }
+        if (c.kind === 'minute') {
+          minuteHits.set(pick.model, (minuteHits.get(pick.model) || 0) + 1);
+          await log(`${label}: ${pick.model} al limite al minuto, lo rimetto in fila tra ${Math.ceil(c.waitMs / 1000)} s`);
+          continue;
+        }
+        if (c.kind === 'overload') { await log(`${label}: ${pick.model} sovraccarico, lo salto per qualche minuto`); continue; }
+        if (e instanceof ApiError && [403, 404].includes(e.status) && pick.model !== candidates[0].model) {
+          missing.add(pick.model);
+          continue;
+        }
+        if (e instanceof ApiError && [403, 404].includes(e.status) && pick.kind === 'transcribe') {
+          await log(`Modello di trascrizione non disponibile (${e.message}); uso i modelli generali`);
+          missing.add(pick.model);
+          strategy = { ...strategy, transcribe: { ...strategy.transcribe, use: false } };
+          saveStrategy(strategy);
+          continue;
+        }
         throw e;
       }
     }
-    throw new BusyError(lastErr || new ApiError('Nessun modello disponibile.', 503));
   };
 
   // ---- Autodiagnosi (una volta per esecuzione)
@@ -205,54 +272,42 @@ export async function processJob(id, ctx) {
     try {
       // Trascrizione letterale
       if (typeof chunk.raw !== 'string') {
-        let raw, engine;
-        const t = strategy.transcribe;
-        if (chunk.mode !== 'range' && t.use) {
-          const a = await audioFor(i, t);
-          progress({ step: 'transcribe', chunk: i, total });
-          try {
-            raw = await gemini.transcribe({
-              model: settings.transcribeModel, audio: a, language: settings.language,
-              vocabulary: t.vocab ? vocabulary : [], maxOutputTokens: 32768, overloadRetries: 3,
-            });
-            engine = settings.transcribeModel;
-          } catch (e) {
-            if (e.name === 'AbortError' || !(e instanceof ApiError)) throw e;
-            if ([403, 404].includes(e.status)) {
-              await log(`Modello di trascrizione non disponibile (${e.message}); uso ${settings.reviseModel}`);
-              strategy = { ...strategy, transcribe: { ...t, use: false } };
-              saveStrategy(strategy);
-            } else if (isTransient(e)) {
-              await log(`${settings.transcribeModel} sovraccarico: trascrivo questo blocco con un modello generale`);
-            } else throw e;
-          }
-        }
-        if (raw === undefined) {
-          const r = strategy.revise;
-          const a = await audioFor(i, r);
-          progress({ step: 'transcribe', chunk: i, total });
-          ({ text: raw, model: engine } = await withModels('Trascrizione', model => gemini.generate({
-            model, audio: a, endpoint: r.endpoint, label: 'Trascrizione', config: { maxOutputTokens: 32768, thinkingLevel: 'low' }, overloadRetries: 2,
-            prompt: transcriptionPrompt({ course: job.course, glossary: glossaryText, range: chunk.mode === 'range' ? [chunk.start, chunk.end] : null }),
-          })));
-        }
+        const secs = chunk.end - chunk.start;
+        const info = { chunk: i, total };
+        const range = chunk.mode === 'range' ? [chunk.start, chunk.end] : null;
+        const candidates = [
+          ...(chunk.mode !== 'range' && strategy.transcribe.use ? [{ model: settings.transcribeModel, kind: 'transcribe' }] : []),
+          ...chain.map(model => ({ model, kind: 'generate' })),
+        ];
+        progress({ step: 'transcribe', ...info });
+        let { text: raw, model: engine } = await runStep({
+          label: 'Trascrizione', candidates, tokens: quota.estimateTokens(secs), info,
+          call: async c => {
+            progress({ step: 'transcribe', ...info, model: c.model });
+            if (c.kind === 'transcribe') {
+              const a = await audioFor(i, strategy.transcribe);
+              return gemini.transcribe({ model: c.model, audio: a, language: lang.codes, vocabulary: strategy.transcribe.vocab ? vocabulary : [], maxOutputTokens: 32768 });
+            }
+            const a = await audioFor(i, strategy.revise);
+            return gemini.generate({ model: c.model, audio: a, endpoint: strategy.revise.endpoint, label: 'Trascrizione', config: GEN_CONFIG,
+              prompt: transcriptionPrompt({ course: job.course, glossary: glossaryText, range, lang }) });
+          },
+        });
         raw = stripFences(raw);
         // Risposta interrotta prima della fine dell'audio: si chiede il seguito.
         for (let k = 0; gemini.last?.truncated && raw && k < 4; k++) {
           await log(`Blocco ${i + 1}: trascrizione interrotta dopo ${countWords(raw)} parole, chiedo il seguito`);
-          const r = strategy.revise;
-          const a = await audioFor(i, r);
           const tail = raw.replace(/\s+/g, ' ').slice(-300);
-          const { text: more } = await withModels('Trascrizione', model => gemini.generate({
-            model, audio: a, endpoint: r.endpoint, label: 'Trascrizione', config: { maxOutputTokens: 32768, thinkingLevel: 'low' }, overloadRetries: 2,
-            prompt: continuationPrompt({ course: job.course, glossary: glossaryText, tail }),
-          }));
+          const { text: more } = await runStep({
+            label: 'Trascrizione', candidates: chain.map(model => ({ model, kind: 'generate' })), tokens: quota.estimateTokens(secs), info,
+            call: async c => gemini.generate({ model: c.model, audio: await audioFor(i, strategy.revise), endpoint: strategy.revise.endpoint,
+              label: 'Trascrizione', config: GEN_CONFIG, prompt: continuationPrompt({ course: job.course, glossary: glossaryText, tail, lang }) }),
+          });
           if (!stripFences(more)) break;
           raw = `${raw}\n\n${stripFences(more)}`;
         }
-        const minutes = Math.max(0.1, (chunk.end - chunk.start) / 60);
         const words = countWords(raw);
-        await log(`Blocco ${i + 1}: trascritte ${words} parole in ${fmtTime(chunk.end - chunk.start)} (${Math.round(words / minutes)} al minuto) con ${engine}`);
+        await log(`Blocco ${i + 1}: trascritte ${words} parole in ${fmtTime(secs)} (${Math.round(words / Math.max(0.1, secs / 60))} al minuto) con ${engine}`);
         if (!raw) await log(`Blocco ${i + 1}: nessun parlato riconosciuto`);
         job = await patch(j => { Object.assign(j.chunks[i], { raw, engine }); });
         chunk = job.chunks[i];
@@ -260,26 +315,35 @@ export async function processJob(id, ctx) {
 
       // Revisione
       if (settings.revise && chunk.raw) {
-        const r = strategy.revise;
-        const a = settings.relisten ? await audioFor(i, r) : null;
-        progress({ step: 'revise', chunk: i, total });
+        const info = { chunk: i, total };
+        const withAudio = !!settings.relisten;
+        progress({ step: 'revise', ...info });
         const prompt = revisionPrompt({
-          raw: chunk.raw, course: job.course, glossary: glossaryText, index: i, total,
+          raw: chunk.raw, course: job.course, glossary: glossaryText, index: i, total, lang,
           start: chunk.start, end: chunk.end, prevTail: i > 0 ? tailOf(job.chunks[i - 1]) : '',
-          withAudio: !!a, range: chunk.mode === 'range' ? [chunk.start, chunk.end] : null,
+          withAudio, range: chunk.mode === 'range' ? [chunk.start, chunk.end] : null,
         });
-        const { text, model } = await withModels('Revisione', m => gemini.generate({
-          model: m, prompt, audio: a, endpoint: r.endpoint, label: 'Revisione', config: REVISE_CONFIG, overloadRetries: 2,
-        }));
+        const { text, model } = await runStep({
+          label: 'Revisione', candidates: chain.map(m => ({ model: m, kind: 'generate' })),
+          tokens: quota.estimateTokens(withAudio ? chunk.end - chunk.start : 0, prompt.length), info,
+          call: async c => {
+            progress({ step: 'revise', ...info, model: c.model });
+            const a = withAudio ? await audioFor(i, strategy.revise) : null;
+            return gemini.generate({ model: c.model, prompt, audio: a, endpoint: strategy.revise.endpoint, label: 'Revisione', config: GEN_CONFIG });
+          },
+        });
         const revised = stripFences(text);
         if (!revised) throw new ApiError('La revisione è tornata vuota.', 500);
         const truncated = !!gemini.last?.truncated;
         const paragraphs = paragraphsFromChunk(revised, chunk.start, chunk.end);
         const check = completenessCheck(chunk.raw, revised);
-        let warn = check.warn;
-        if (truncated) warn = 'La revisione si è interrotta prima della fine del blocco: la parte finale è solo nella versione grezza.';
+        const warns = [];
+        if (truncated) warns.push('La revisione si è interrotta prima della fine del blocco: la parte finale è solo nella versione grezza.');
+        else if (check.warn) warns.push(check.warn);
+        if (withAudio) warns.push(...coverageWarnings(paragraphs, chunk.start, chunk.end, job.duration));
+        const warn = warns.join(' ') || null;
         if (warn) await log(`Blocco ${i + 1}: ${warn}`);
-        if (model !== settings.reviseModel) await log(`Blocco ${i + 1}: rivisto con ${model} (il modello scelto era sovraccarico)`);
+        if (model !== settings.reviseModel) await log(`Blocco ${i + 1}: rivisto con ${model}`);
         job = await patch(j => { Object.assign(j.chunks[i], { revised, paragraphs, ratio: check.ratio, warn, reviseEngine: model }); });
       } else {
         job = await patch(j => { const c = j.chunks[i]; c.paragraphs = paragraphsFromRaw(c.raw || '', c.start); });

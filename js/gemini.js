@@ -81,7 +81,7 @@ export class Gemini {
     this.legacy = false;
   }
 
-  async call(path, init = {}, { retries = 6, label = 'Gemini', overloadRetries = 6 } = {}) {
+  async call(path, init = {}, { retries = 5, label = 'Gemini', overloadRetries = 1 } = {}) {
     const url = path.startsWith('http') ? path : GEMINI_BASE + path;
     for (let attempt = 0; ; attempt++) {
       let res;
@@ -100,7 +100,9 @@ export class Gemini {
       const msg = body?.error?.message || `HTTP ${res.status}`;
       const retryable = [429, 500, 502, 503, 504].includes(res.status);
       const hint = retryDelayMs(body);
-      const limit = res.status === 503 ? Math.min(retries, overloadRetries) : retries;
+      // 429 (quota) e 503 (sovraccarico) li gestisce il dosatore delle quote: qui al massimo
+      // un tentativo rapido per il 503, nessuno per il 429.
+      const limit = res.status === 429 ? 0 : res.status === 503 ? Math.min(retries, overloadRetries) : retries;
       if (retryable && attempt < limit && !(hint && hint > 5 * 60_000)) {
         await this.backoff(attempt, hint, label, res.status === 429 ? 'limite di richieste' : `errore ${res.status}`);
         continue;
@@ -279,7 +281,8 @@ export class Gemini {
   /** Trascrizione con il modello dedicato (gemini-3.5-transcribe). */
   async transcribe({ model, audio, language, vocabulary, maxOutputTokens, overloadRetries }) {
     const cfg = {};
-    if (language) cfg.language_codes = [language];
+    const langs = Array.isArray(language) ? language : (language ? [language] : []);
+    if (langs.length) cfg.language_codes = langs;
     if (vocabulary?.length) cfg.custom_vocabulary = vocabulary;
     const body = { model, input: [audioItem(audio)] };
     if (Object.keys(cfg).length) body.generation_config = { transcription_config: cfg };
