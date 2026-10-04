@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Sbobina</title>
+  <meta name="description" content="Trascrizione letterale delle lezioni universitarie, con revisione e riascolto.">
+  <meta name="theme-color" content="#f6f5f0" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1c2622" media="(prefers-color-scheme: dark)">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,500;0,7..72,600;1,7..72,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/app.css">
+  <script>
+    // Tema applicato prima del disegno della pagina, per evitare il lampo bianco.
+    try { const t = JSON.parse(localStorage.getItem('sbobina.dev.theme') || '"auto"'); if (t !== 'auto') document.documentElement.dataset.theme = t; } catch (e) {}
+  </script>
+</head>
+<body data-screen="list">
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5z" fill="currentColor"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z" fill="currentColor"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="M11 6 5 12l6 6M5 12h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><path d="M4 7h9M17 7h3M4 17h3M11 17h9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="15" cy="7" r="2.2" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="9" cy="17" r="2.2" fill="none" stroke="currentColor" stroke-width="1.7"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M19.5 14.5A8 8 0 0 1 9.5 4.5a8 8 0 1 0 10 10z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+    <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M7 18.5h10a4 4 0 0 0 .6-7.95A5.5 5.5 0 0 0 7 9.6 4.5 4.5 0 0 0 7 18.5z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  </svg>
+
+  <div class="app">
+    <!-- Elenco delle lezioni -->
+    <aside class="sidebar" aria-label="Lezioni">
+      <header class="bar">
+        <h1 class="brand"><button type="button" data-go="home">Sbobina</button></h1>
+        <div class="bar-actions">
+          <button type="button" class="icon" id="syncBtn" hidden><svg><use href="#i-cloud"/></svg><span class="sync-dot"></span></button>
+          <button type="button" class="icon" id="themeBtn" aria-label="Cambia tema"><svg><use href="#i-moon"/></svg></button>
+          <button type="button" class="icon" id="settingsBtn" aria-label="Impostazioni" data-go="settings"><svg><use href="#i-gear"/></svg></button>
+        </div>
+      </header>
+
+      <div class="notice" id="notice" hidden></div>
+
+      <label class="add" id="addZone">
+        <input type="file" id="fileInput" accept="audio/*,.aac,.m4a,.mp3,.wav,.ogg,.opus" multiple hidden>
+        <span class="add-mark"><svg><use href="#i-plus"/></svg></span>
+        <span class="add-text">
+          <span class="add-title">Aggiungi una registrazione</span>
+          <span class="add-hint" id="addHint">Oppure condividila dal Registratore</span>
+        </span>
+      </label>
+
+      <ol class="lectures" id="lectureList"></ol>
+      <p class="empty" id="emptyList" hidden>Le lezioni trascritte compariranno qui.</p>
+    </aside>
+
+    <!-- Pannello principale -->
+    <main class="pane">
+      <section class="view" id="vHome">
+        <div class="placeholder">
+          <p class="placeholder-title">Scegli una lezione dall'elenco</p>
+          <p>oppure trascina qui un file audio per trascriverlo.</p>
+        </div>
+      </section>
+
+      <section class="view" id="vNew" hidden>
+        <header class="view-head">
+          <button type="button" class="icon back" data-go="home" aria-label="Indietro"><svg><use href="#i-back"/></svg></button>
+          <h2>Nuova trascrizione</h2>
+        </header>
+        <form id="newForm" class="form" autocomplete="off">
+          <div id="newFiles"></div>
+          <div class="field">
+            <label for="newCourse">Corso</label>
+            <select id="newCourse"></select>
+            <input id="newCourseName" placeholder="Nome del nuovo corso" hidden>
+          </div>
+          <div class="field">
+            <label for="newGlossary">Termini tecnici del corso</label>
+            <textarea id="newGlossary" rows="4" placeholder="verosimiglianza, stimatore di massima verosimiglianza, matrice di Fisher, bootstrap…"></textarea>
+            <p class="help">Separati da virgole. Aiutano a riconoscere parole rare e restano salvati nel corso.</p>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="primary" id="startBtn">Trascrivi</button>
+            <button type="button" class="quiet" id="cancelNew">Annulla</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="view lecture" id="vLecture" hidden>
+        <header class="view-head">
+          <button type="button" class="icon back" data-go="home" aria-label="Indietro"><svg><use href="#i-back"/></svg></button>
+          <div class="lecture-titles">
+            <h2 id="lecTitle" tabindex="0" title="Tocca per rinominare"></h2>
+            <p class="meta" id="lecMeta"></p>
+          </div>
+        </header>
+
+        <nav class="actions" id="lecActions" aria-label="Azioni sulla lezione">
+          <button type="button" data-act="copy">Copia</button>
+          <button type="button" data-act="save">Salva .md</button>
+          <button type="button" data-act="share" hidden>Condividi</button>
+          <button type="button" data-act="edit">Modifica</button>
+          <button type="button" data-act="delete" class="danger">Elimina</button>
+        </nav>
+
+        <div class="status" id="lecStatus" hidden>
+          <div class="status-line"><span id="statusText"></span><span class="status-actions" id="statusActions"></span></div>
+          <div class="progress"><span id="progressFill"></span></div>
+          <details class="log"><summary>Dettagli</summary><pre id="logText"></pre></details>
+        </div>
+
+        <div class="checks" id="lecChecks" hidden></div>
+
+        <div class="tabs" id="lecTabs" role="tablist" hidden>
+          <button type="button" role="tab" data-tab="revised" aria-selected="true">Rivista</button>
+          <button type="button" role="tab" data-tab="raw" aria-selected="false">Grezza</button>
+          <button type="button" class="uncertain-jump" id="uncertainBtn" hidden></button>
+        </div>
+
+        <article class="transcript" id="transcript" aria-live="off"></article>
+
+        <div class="editor" id="editorWrap" hidden>
+          <p class="help">Ogni paragrafo è separato da una riga vuota. Il tempo tra parentesi quadre all'inizio collega il paragrafo all'audio.</p>
+          <textarea id="editor" spellcheck="true"></textarea>
+          <div class="form-actions">
+            <button type="button" class="primary" id="saveEdit">Salva modifiche</button>
+            <button type="button" class="quiet" id="cancelEdit">Annulla</button>
+            <button type="button" class="quiet" id="resetEdit" hidden>Ripristina la versione automatica</button>
+          </div>
+        </div>
+
+        <div class="player" id="player">
+          <div class="timeline">
+            <div class="ticks" data-p="ticks"></div>
+            <input type="range" min="0" max="1000" step="1" value="0" data-p="seek" aria-label="Posizione nella lezione">
+          </div>
+          <div class="controls">
+            <span class="time" data-p="cur">00:00</span>
+            <div class="buttons">
+              <button type="button" class="skip" data-p="back" aria-label="Indietro 5 secondi">−5</button>
+              <button type="button" class="play" data-p="play" data-state="play" aria-label="Riproduci">
+                <svg class="i-play"><use href="#i-play"/></svg><svg class="i-pause"><use href="#i-pause"/></svg>
+              </button>
+              <button type="button" class="skip" data-p="fwd" aria-label="Avanti 5 secondi">+5</button>
+              <button type="button" class="rate" data-p="rate">1×</button>
+            </div>
+            <span class="time end" data-p="dur">00:00</span>
+          </div>
+          <p class="player-msg" data-p="msg" hidden></p>
+        </div>
+      </section>
+
+      <section class="view" id="vSettings" hidden>
+        <header class="view-head">
+          <button type="button" class="icon back" data-go="home" aria-label="Indietro"><svg><use href="#i-back"/></svg></button>
+          <h2>Impostazioni</h2>
+        </header>
+        <form class="form settings" id="settingsForm" autocomplete="off" onsubmit="return false">
+          <fieldset>
+            <legend>Gemini</legend>
+            <div class="field">
+              <label for="sKey">Chiave API</label>
+              <div class="row">
+                <input id="sKey" type="password" placeholder="AIza…" spellcheck="false">
+                <button type="button" class="quiet" id="sKeyShow">Mostra</button>
+                <button type="button" id="sKeyTest">Verifica</button>
+              </div>
+              <p class="help">Gratuita da <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. Resta tua: va solo a Google, e su Drive nelle impostazioni nascoste di Sbobina.</p>
+              <p class="help result" id="sKeyResult"></p>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Google Drive</legend>
+            <p class="drive-state" id="sDriveState"></p>
+            <div class="row" id="sDriveButtons">
+              <button type="button" class="primary" id="sDriveConnect">Collega Drive</button>
+              <button type="button" class="quiet" id="sDriveDisconnect" hidden>Scollega</button>
+            </div>
+            <div class="field" id="sClientField">
+              <label for="sClient">ID client OAuth</label>
+              <input id="sClient" placeholder="123…apps.googleusercontent.com" spellcheck="false">
+              <p class="help">Si crea una volta su Google Cloud: i passaggi sono nel README. Se lo metti in <code>js/config.js</code> non serve inserirlo qui.</p>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Trascrizione</legend>
+            <div class="field">
+              <label for="sChunk">Durata dei blocchi: <output id="sChunkOut"></output> minuti</label>
+              <input id="sChunk" type="range" min="10" max="40" step="5">
+              <p class="help">La lezione viene tagliata nelle pause in blocchi di questa durata. Blocchi più corti rendono la revisione più fedele.</p>
+            </div>
+            <label class="check"><input type="checkbox" id="sRevise"> Revisione: punteggiatura, paragrafi, correzioni dal contesto</label>
+            <label class="check"><input type="checkbox" id="sRelisten"> Durante la revisione il modello riascolta l'audio (serve per i tempi dei paragrafi)</label>
+            <details class="advanced">
+              <summary>Modelli</summary>
+              <div class="field">
+                <label for="sTModel">Modello di trascrizione</label>
+                <input id="sTModel" spellcheck="false">
+              </div>
+              <div class="field">
+                <label for="sRModel">Modello di revisione</label>
+                <input id="sRModel" spellcheck="false">
+              </div>
+              <div class="field">
+                <label for="sLang">Lingua (codice BCP-47)</label>
+                <input id="sLang" spellcheck="false">
+              </div>
+            </details>
+          </fieldset>
+
+          <fieldset>
+            <legend>Corsi e termini tecnici</legend>
+            <div id="sCourses"></div>
+            <button type="button" class="quiet" id="sAddCourse">Aggiungi corso</button>
+          </fieldset>
+
+          <fieldset id="sFolderSet" hidden>
+            <legend>Cartella sul PC</legend>
+            <p class="drive-state" id="sFolderState"></p>
+            <div class="row">
+              <button type="button" id="sFolderPick">Scegli cartella</button>
+              <button type="button" class="quiet" id="sFolderAll" hidden>Salva tutte adesso</button>
+            </div>
+            <label class="check"><input type="checkbox" id="sFolderAuto"> Salva automaticamente ogni lezione completata</label>
+          </fieldset>
+
+          <fieldset>
+            <legend>Questo dispositivo</legend>
+            <div class="field">
+              <label for="sTheme">Tema</label>
+              <select id="sTheme">
+                <option value="auto">Come il sistema</option>
+                <option value="light">Chiaro</option>
+                <option value="dark">Scuro (lavagna)</option>
+              </select>
+            </div>
+            <p class="drive-state" id="sStorage"></p>
+            <button type="button" class="quiet" id="sFreeSpace" hidden>Libera spazio (l'audio resta su Drive)</button>
+          </fieldset>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <div class="drop-veil" id="dropVeil" hidden><p>Rilascia il file audio per trascriverlo</p></div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
