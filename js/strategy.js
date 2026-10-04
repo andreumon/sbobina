@@ -7,7 +7,7 @@
 //   - endpoint:  Interactions API | generateContent
 //   - vocabolario personalizzato sì/no (solo per il modello di trascrizione)
 import { analyzeAdts, byteParts, sliceParts } from './aac.js';
-import { blobToBase64, ApiError } from './gemini.js';
+import { blobToBase64, ApiError, isTransient } from './gemini.js';
 import { device } from './store.js';
 
 export const INLINE_MAX_BYTES = 12_000_000; // la richiesta intera deve stare sotto i 20 MB, base64 incluso
@@ -87,9 +87,16 @@ export async function probeSlice(audio) {
 // ---------------------------------------------------------------- Diagnosi
 
 /**
- * @returns {Promise<{strategy: object|null, results: {label, ok, error?}[]}>}
+ * gemini: un client o un elenco di client (chiave principale, poi riserva).
+ * Un errore di quota o sovraccarico (429/5xx) NON dice nulla sulla forma della richiesta:
+ * si ripete la stessa prova con la chiave successiva; se nessuna può rispondere, la prova
+ * resta "non verificata" e per quel passo si tiene la variante attuale (current).
+ * @returns {Promise<{strategy: object|null, results: {label, ok, error?, skipped?}[], quotaBlocked: boolean}>}
  */
-export async function diagnose(gemini, { audio, settings, vocabulary = [], onStep = () => {} }) {
+export async function diagnose(gemini, { audio, settings, vocabulary = [], onStep = () => {}, current = DEFAULT_STRATEGY, onTransient = () => {} }) {
+  const clients = (Array.isArray(gemini) ? gemini : [gemini]).filter(Boolean);
+  let ci = 0;
+  let quotaBlocked = false;
   const results = [];
   const native = audio ? await probeSlice(audio) : null;
   const formats = [];
@@ -102,58 +109,79 @@ export async function diagnose(gemini, { audio, settings, vocabulary = [], onSte
   } else wav = toneWav();
   if (wav) formats.push({ format: 'wav', blob: wav, mime: 'audio/wav' });
 
+  // I file caricati appartengono al progetto della chiave: uno per chiave e formato.
   const uploaded = {};
-  const ref = async (f, transport) => {
+  const ref = async (g, f, transport) => {
     if (transport === 'inline') return { data: await blobToBase64(f.blob), mimeType: f.mime };
-    if (!uploaded[f.format]) {
-      const file = await gemini.upload(f.blob, f.mime, `sbobina-diagnosi-${f.format}`);
-      uploaded[f.format] = { uri: file.uri, mimeType: f.mime, name: file.name };
+    const k = `${clients.indexOf(g)}:${f.format}`;
+    if (!uploaded[k]) {
+      const file = await g.upload(f.blob, f.mime, `sbobina-diagnosi-${f.format}`);
+      uploaded[k] = { uri: file.uri, mimeType: f.mime, name: file.name, g };
     }
-    return uploaded[f.format];
+    return uploaded[k];
   };
-  const attempt = async (label, fn) => {
+  const errText = e => `${e.status ? `HTTP ${e.status}: ` : ''}${e.message}${e.detail ? ` (${e.detail})` : ''}`;
+  /** true = accettata, false = rifiutata, null = non verificabile (quota/sovraccarico su tutte le chiavi). */
+  const attempt = async (label, model, fn) => {
     onStep(label);
-    try {
-      await fn();
-      results.push({ label, ok: true });
-      return true;
-    } catch (e) {
-      if (e.name === 'AbortError') throw e;
-      results.push({ label, ok: false, error: `${e.status ? `HTTP ${e.status}: ` : ''}${e.message}${e.detail ? ` (${e.detail})` : ''}` });
-      return false;
+    for (;;) {
+      try {
+        await fn(clients[ci]);
+        results.push({ label: clients.length > 1 && ci > 0 ? `${label} [chiave di riserva]` : label, ok: true });
+        return true;
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+        if (isTransient(e)) {
+          onTransient(clients[ci], model, e); // così il dosatore delle quote sa che quel modello è esaurito
+          if (ci + 1 < clients.length) { ci++; continue; } // stessa prova con la chiave successiva
+          quotaBlocked = true;
+          results.push({ label, ok: false, skipped: true, error: `non verificabile adesso: ${e.status === 429 ? 'quota esaurita' : 'Google sovraccarico'} (${e.message.split('. ')[0]})` });
+          return null;
+        }
+        results.push({ label, ok: false, error: errText(e) });
+        return false;
+      }
     }
   };
 
-  let transcribe = null, revise = null;
+  // undefined = da provare, null = non verificabile adesso (quota), oggetto = variante trovata
+  let transcribe, revise;
   for (const f of formats) {
     for (const transport of ['uri', 'inline']) {
-      if (!transcribe) {
-        const ok = await attempt(`${settings.transcribeModel}, ${f.format === 'wav' ? 'WAV' : 'AAC'}, ${transport === 'uri' ? 'file caricato' : 'inline'}`,
-          async () => gemini.transcribe({ model: settings.transcribeModel, audio: await ref(f, transport), language: settings.language }));
+      if (transcribe === undefined) {
+        const ok = await attempt(`${settings.transcribeModel}, ${f.format === 'wav' ? 'WAV' : 'AAC'}, ${transport === 'uri' ? 'file caricato' : 'inline'}`, settings.transcribeModel,
+          async g => g.transcribe({ model: settings.transcribeModel, audio: await ref(g, f, transport), language: settings.language }));
+        if (ok === null) transcribe = null;
         if (ok) {
           transcribe = { use: true, transport, format: f.format, vocab: true };
           if (vocabulary.length) {
-            const okVocab = await attempt('  …con il vocabolario del corso',
-              async () => gemini.transcribe({ model: settings.transcribeModel, audio: await ref(f, transport), language: settings.language, vocabulary }));
-            transcribe.vocab = okVocab;
+            const okVocab = await attempt('  …con il vocabolario del corso', settings.transcribeModel,
+              async g => g.transcribe({ model: settings.transcribeModel, audio: await ref(g, f, transport), language: settings.language, vocabulary }));
+            transcribe.vocab = okVocab !== false;
           }
         }
       }
       for (const endpoint of ['interactions', 'generate']) {
-        if (revise) break;
-        const ok = await attempt(`${settings.reviseModel}, ${endpoint === 'generate' ? 'generateContent' : 'Interactions'}, ${f.format === 'wav' ? 'WAV' : 'AAC'}, ${transport === 'uri' ? 'file caricato' : 'inline'}`,
-          async () => gemini.generate({ model: settings.reviseModel, endpoint, label: 'Diagnosi', audio: await ref(f, transport), prompt: 'Trascrivi questo audio.' }));
+        if (revise !== undefined) break;
+        const ok = await attempt(`${settings.reviseModel}, ${endpoint === 'generate' ? 'generateContent' : 'Interactions'}, ${f.format === 'wav' ? 'WAV' : 'AAC'}, ${transport === 'uri' ? 'file caricato' : 'inline'}`, settings.reviseModel,
+          async g => g.generate({ model: settings.reviseModel, endpoint, label: 'Diagnosi', audio: await ref(g, f, transport), prompt: 'Trascrivi questo audio.' }));
+        if (ok === null) revise = null;
         if (ok) revise = { endpoint, transport, format: f.format };
       }
-      if (transcribe && revise) break;
+      if (transcribe !== undefined && revise !== undefined) break;
     }
-    if (transcribe && revise) break;
+    if (transcribe !== undefined && revise !== undefined) break;
   }
-  for (const u of Object.values(uploaded)) gemini.deleteFile(u.name);
+  for (const u of Object.values(uploaded)) u.g.deleteFile(u.name);
 
-  if (!revise) return { strategy: null, results };
+  // Passi non verificabili per quota: si tiene la variante attuale invece di "bocciarla".
+  if (revise === null) revise = current.revise;
+  if (transcribe === null) transcribe = current.transcribe;
+  if (!revise) return { strategy: null, results, quotaBlocked };
   if (!transcribe) transcribe = { use: false, transport: revise.transport, format: revise.format, vocab: false };
-  return { strategy: { transcribe, revise, testedAt: Date.now() }, results };
+  // Nulla di nuovo verificato (tutto bloccato dalla quota): nessuna strategia da salvare.
+  if (quotaBlocked && !results.some(r => r.ok)) return { strategy: null, results, quotaBlocked };
+  return { strategy: { transcribe, revise, testedAt: Date.now() }, results, quotaBlocked };
 }
 
 export function describeStrategy(s) {

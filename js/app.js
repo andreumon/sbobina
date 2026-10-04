@@ -438,7 +438,7 @@ $('cancelNew').addEventListener('click', async () => {
 $('newForm').addEventListener('submit', async e => {
   e.preventDefault();
   if (!state.pending.length) return;
-  if (!settings.apiKey) {
+  if (!hasKey(settings)) {
     toast('Prima inserisci la chiave API Gemini.');
     renderSettings(); show('settings'); $('sKey').focus();
     return;
@@ -554,7 +554,7 @@ async function scheduleWakeups() {
 
 async function runQueue() {
   if (state.runner) return;
-  if (!settings.apiKey) return;
+  if (!hasKey(settings)) return;
   for (;;) {
     const jobs = (await store.listJobs()).filter(j => j.status === 'queued' && (!j.runner || j.runner === store.deviceId))
       .sort((a, b) => a.createdAt - b.createdAt);
@@ -615,8 +615,8 @@ function progressText(job, p) {
     }
     case 'diagnose': return `Google ha rifiutato la richiesta: provo alcune varianti${p.label ? ` (${p.label})` : ''}…`;
     case 'upload': return `${part}invio a Gemini ${Math.round((p.progress || 0) * 100)}%`;
-    case 'transcribe': return `${part}trascrizione letterale${p.model ? ` con ${p.model}` : ''}…`;
-    case 'revise': return `${part}revisione e controllo${p.model ? ` con ${p.model}` : ''}…`;
+    case 'transcribe': return `${part}trascrizione letterale${p.model ? ` con ${p.model}${p.reserve ? ' (chiave di riserva)' : ''}` : ''}…`;
+    case 'revise': return `${part}revisione e controllo${p.model ? ` con ${p.model}${p.reserve ? ' (chiave di riserva)' : ''}` : ''}…`;
     case 'done': return 'Completata';
     default: return 'In elaborazione…';
   }
@@ -742,7 +742,7 @@ function renderStatus(job) {
       if (stale) actions = '<button type="button" class="btn" data-run="takeover">Continua qui</button>';
     } else {
       text = state.runner ? 'In coda dopo la lezione in corso.' : 'In coda.';
-      if (!settings.apiKey) text = 'Manca la chiave API Gemini: inseriscila nelle impostazioni.';
+      if (!hasKey(settings)) text = 'Manca la chiave API Gemini: inseriscila nelle impostazioni.';
     }
     const doneChunks = (job.chunks || []).filter(c => c.paragraphs).length;
     if (!mine) $('progressFill').style.width = job.chunks?.length ? `${(doneChunks / job.chunks.length) * 100}%` : '0';
@@ -1217,7 +1217,7 @@ function renderSyncState() {
   b.setAttribute('aria-label', labels[st]);
   b.title = labels[st];
 
-  if (!settings.apiKey) notice('Per iniziare inserisci la chiave API Gemini nelle <button type="button" data-go="settings">impostazioni</button>.');
+  if (!hasKey(settings)) notice('Per iniziare inserisci la chiave API Gemini nelle <button type="button" data-go="settings">impostazioni</button>.');
   else if (drive.configured && st === 'expired') notice('L\'accesso a Google Drive è scaduto. <button type="button" id="reconnect">Ricollega</button> per sincronizzare.');
   else notice('');
 }
@@ -1255,13 +1255,37 @@ store.on('settings', ({ settings: s, fromRemote }) => {
   settings = s;
   if (fromRemote && state.view === 'settings' && !document.activeElement?.closest('#settingsForm')) renderSettings();
   renderSyncState();
-  if (s.apiKey) runQueue();
+  if (hasKey(s)) runQueue();
 });
 drive.onChange(renderSyncState);
 
 // ====================================================================
 // Impostazioni
 // ====================================================================
+
+/**
+ * Le due chiavi sono dello stesso progetto Google? I file della Files API appartengono al
+ * progetto: se la seconda chiave legge un file caricato con la prima, il progetto è lo stesso
+ * (e quindi anche le quote). Ritorna true, false o null se la prova non riesce.
+ */
+async function sameProject(keyA, keyB) {
+  const a = new Gemini(keyA), b = new Gemini(keyB);
+  let file;
+  try {
+    file = await a.uploadMultipart(new Blob(['sbobina'], { type: 'text/plain' }), 'text/plain', 'sbobina-verifica-progetto');
+  } catch { return null; }
+  try {
+    await b.call(`/v1beta/${file.name}`, {}, { retries: 0, label: 'Verifica progetto' });
+    return true;
+  } catch (e) {
+    return [403, 404].includes(e.status) ? false : null;
+  } finally {
+    a.deleteFile(file.name);
+  }
+}
+
+/** C'è almeno una chiave API (principale o di riserva)? */
+function hasKey(s) { return !!((s.apiKey || '').trim() || (s.apiKey2 || '').trim()); }
 
 let settingsTimer;
 function saveSetting(patch) {
@@ -1274,6 +1298,8 @@ function renderSettings() {
   settings = store.loadSettings();
   $('sKey').value = settings.apiKey;
   $('sKeyResult').textContent = '';
+  $('sKey2').value = settings.apiKey2 || '';
+  $('sKey2Result').textContent = '';
   $('sChunk').value = settings.chunkMin;
   $('sChunkOut').textContent = settings.chunkMin;
   $('sRevise').checked = settings.revise;
@@ -1291,34 +1317,55 @@ function renderSettings() {
   renderStorage();
 }
 
-$('sKey').addEventListener('change', () => saveSetting({ apiKey: $('sKey').value.trim() }));
-$('sKeyShow').addEventListener('click', () => {
-  const k = $('sKey');
-  k.type = k.type === 'password' ? 'text' : 'password';
-  $('sKeyShow').textContent = k.type === 'password' ? 'Mostra' : 'Nascondi';
-});
-$('sKeyTest').addEventListener('click', async () => {
-  const key = $('sKey').value.trim();
-  saveSetting({ apiKey: key });
-  const out = $('sKeyResult');
-  out.className = 'help result';
-  out.textContent = 'Verifico…';
-  try {
-    const models = await new Gemini(key).listModels();
-    const t = models.includes(settings.transcribeModel), r = models.includes(settings.reviseModel);
-    out.classList.add(t && r ? 'ok' : 'bad');
-    out.textContent = t && r
-      ? 'Chiave valida, modelli disponibili.'
-      : `Chiave valida, ma non trovo ${[!t && settings.transcribeModel, !r && settings.reviseModel].filter(Boolean).join(' e ')}. Modelli disponibili: ${models.filter(m => /gemini/.test(m)).slice(0, 12).join(', ')}…`;
-  } catch (e) {
-    out.classList.add('bad');
-    out.textContent = explainError(e);
-  }
-});
+// Chiave principale e chiave di riserva: stessi controlli, stessa verifica.
+for (const [input, show, test, result, field] of [['sKey', 'sKeyShow', 'sKeyTest', 'sKeyResult', 'apiKey'], ['sKey2', 'sKey2Show', 'sKey2Test', 'sKey2Result', 'apiKey2']]) {
+  $(input).addEventListener('change', () => saveSetting({ [field]: $(input).value.trim() }));
+  $(show).addEventListener('click', () => {
+    const k = $(input);
+    k.type = k.type === 'password' ? 'text' : 'password';
+    $(show).textContent = k.type === 'password' ? 'Mostra' : 'Nascondi';
+  });
+  $(test).addEventListener('click', async () => {
+    const key = $(input).value.trim();
+    saveSetting({ [field]: key });
+    const out = $(result);
+    out.className = 'help result';
+    if (!key) { out.textContent = field === 'apiKey2' ? 'Nessuna chiave di riserva: Sbobina userà solo la principale.' : 'Inserisci la chiave.'; return; }
+    if (field === 'apiKey2' && key === (settings.apiKey || '').trim()) {
+      out.classList.add('bad');
+      out.textContent = 'È uguale alla chiave principale: come riserva non serve.';
+      return;
+    }
+    out.textContent = 'Verifico…';
+    try {
+      const models = await new Gemini(key).listModels();
+      const t = models.includes(settings.transcribeModel), r = models.includes(settings.reviseModel);
+      out.classList.add(t && r ? 'ok' : 'bad');
+      out.textContent = t && r
+        ? 'Chiave valida, modelli disponibili.'
+        : `Chiave valida, ma non trovo ${[!t && settings.transcribeModel, !r && settings.reviseModel].filter(Boolean).join(' e ')}. Modelli disponibili: ${models.filter(m => /gemini/.test(m)).slice(0, 12).join(', ')}…`;
+      if (field === 'apiKey2' && (settings.apiKey || '').trim()) {
+        out.textContent += ' Controllo che sia di un altro progetto…';
+        const same = await sameProject(settings.apiKey.trim(), key);
+        if (same === true) {
+          out.className = 'help result bad';
+          out.textContent = 'Chiave valida, ma è dello stesso progetto Google della principale: condivide le stesse quote, quindi come riserva aiuta solo se la principale viene revocata. Crea la chiave in un altro progetto.';
+        } else if (same === false) {
+          out.textContent = out.textContent.replace(' Controllo che sia di un altro progetto…', ' È di un altro progetto: ha quote proprie.');
+        } else {
+          out.textContent = out.textContent.replace(' Controllo che sia di un altro progetto…', ' (Non sono riuscito a verificare se è di un altro progetto.)');
+        }
+      }
+    } catch (e) {
+      out.classList.add('bad');
+      out.textContent = explainError(e);
+    }
+  });
+}
 $('sDiag').addEventListener('click', async () => {
   const out = $('sDiagOut');
   const btn = $('sDiag');
-  if (!settings.apiKey) { out.hidden = false; out.textContent = 'Inserisci prima la chiave API.'; return; }
+  if (!hasKey(settings)) { out.hidden = false; out.textContent = 'Inserisci prima la chiave API.'; return; }
   btn.disabled = true;
   out.hidden = false;
   out.textContent = 'Provo le varianti della richiesta (circa un minuto)…';
@@ -1327,13 +1374,19 @@ $('sDiag').addEventListener('click', async () => {
     let audio = null;
     for (const j of await store.listJobs()) { audio = await store.getAudio(j.id); if (audio) break; }
     const lines = [];
-    const { strategy, results } = await diagnose(new Gemini(settings.apiKey), {
-      audio, settings, onStep: label => { out.textContent = `${lines.join('\n')}\n… ${label}`.trim(); },
+    const keyList = [settings.apiKey, settings.apiKey2].map(k => (k || '').trim()).filter((k, i, a) => k && a.indexOf(k) === i);
+    const { strategy, results, quotaBlocked } = await diagnose(keyList.map(k => new Gemini(k)), {
+      audio, settings, current: loadStrategy(),
+      onTransient: (g, model, e) => quota.onError(quota.scoped(model, g.key === keyList[0] ? '' : 'k2'), e),
+      onStep: label => { out.textContent = `${lines.join('\n')}\n… ${label}`.trim(); },
     });
-    for (const r of results) lines.push(`${r.ok ? 'OK ' : 'NO '} ${r.label}${r.ok ? '' : `\n    ${r.error}`}`);
+    for (const r of results) lines.push(`${r.ok ? 'OK ' : r.skipped ? '?? ' : 'NO '} ${r.label}${r.ok ? '' : `\n    ${r.error}`}`);
     if (strategy) {
       saveStrategy(strategy);
       lines.push('', `Variante scelta: ${describeStrategy(strategy)}`);
+      if (quotaBlocked) lines.push('(Le prove segnate ?? non si possono fare ora perché la quota è esaurita: per quei passi resta la variante attuale.)');
+    } else if (quotaBlocked) {
+      lines.push('', 'Quota gratuita esaurita: la diagnosi non è conclusiva e non ho cambiato nulla. Le prove ?? non sono rifiuti di Google: riprova quando la quota si è ripristinata.');
     } else lines.push('', 'Nessuna variante accettata: copia questo testo e mandalo a chi ti aiuta.');
     out.textContent = lines.join('\n');
   } catch (e) {
@@ -1361,7 +1414,8 @@ function renderQuota() {
   const t = Date.now();
   $('sQuota').innerHTML = rows.map(r => {
     const state = r.exhausted ? 'esaurita fino alle 9:00' : r.cooldownUntil > t ? 'in pausa per qualche minuto' : '';
-    return `<p><span>${esc(r.model)}</span><span>${r.used}${r.rpd ? ` / ${r.rpd}` : ''} richieste${state ? `, ${state}` : ''}</span></p>`;
+    const name = quota.keyTagOf(r.model) ? `${quota.baseModel(r.model)} (riserva)` : r.model;
+    return `<p><span>${esc(name)}</span><span>${r.used}${r.rpd ? ` / ${r.rpd}` : ''} richieste${state ? `, ${state}` : ''}</span></p>`;
   }).join('') || '<p>Nessuna richiesta oggi.</p>';
 }
 $('sTheme').addEventListener('change', () => { store.device.set('theme', $('sTheme').value); applyTheme(); });

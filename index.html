@@ -226,6 +226,16 @@
               </div>
               <p class="help">Gratuita da <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. Resta tua: va solo a Google, e su Drive nelle impostazioni nascoste di Sbobina.</p>
               <p class="help result" id="sKeyResult"></p>
+            </div>
+            <div class="field">
+              <label for="sKey2">Chiave di riserva <small>(facoltativa)</small></label>
+              <div class="row">
+                <input id="sKey2" type="password" placeholder="AQ.…" spellcheck="false">
+                <button type="button" class="quiet" id="sKey2Show">Mostra</button>
+                <button type="button" id="sKey2Test">Verifica</button>
+              </div>
+              <p class="help">Usata in automatico quando la principale ha finito la quota, non risponde o viene rifiutata. Serve una chiave di un <b>altro progetto</b> Google: le quote gratuite sono per progetto, non per chiave.</p>
+              <p class="help result" id="sKey2Result"></p>
               <div class="row diag-row">
                 <button type="button" class="quiet" id="sDiag">Diagnostica la connessione con Gemini</button>
                 <button type="button" class="quiet" id="sDiagReset">Ripristina predefinita</button>

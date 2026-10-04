@@ -74,8 +74,10 @@ export function explainError(e) {
 }
 
 export class Gemini {
-  constructor(apiKey, { log = () => {}, signal } = {}) {
+  /** netRetries: tentativi dopo un errore di rete (meno se c'è un'altra chiave a cui passare). */
+  constructor(apiKey, { log = () => {}, signal, netRetries = 5 } = {}) {
     this.key = (apiKey || '').trim();
+    this.netRetries = netRetries;
     this.log = log;
     this.signal = signal;
     this.legacy = false;
@@ -89,7 +91,7 @@ export class Gemini {
         res = await fetch(url, { ...init, signal: this.signal, headers: { 'x-goog-api-key': this.key, ...(init.headers || {}) } });
       } catch (err) {
         if (err.name === 'AbortError') throw err;
-        if (attempt >= retries) throw new ApiError(`Errore di rete (${err.message})`, 0);
+        if (attempt >= Math.min(retries, this.netRetries)) throw new ApiError(`Errore di rete (${err.message})`, 0);
         await this.backoff(attempt, null, label, 'rete assente');
         continue;
       }
@@ -317,6 +319,19 @@ export function extractText(r) {
   }
   return texts.reduce((acc, t) => (acc && !/\s$/.test(acc) && !/^\s/.test(t) ? `${acc} ${t}` : acc + t), '').trim();
 }
+
+/**
+ * Errore legato alla chiave stessa (non valida, revocata, progetto disattivato o senza accesso):
+ * con questa chiave non ha senso riprovare, conviene passare all'altra.
+ */
+// Solo 400/401/403: il 429 di quota esaurita contiene anch'esso parole come "billing",
+// ma è "chiave satura", non "chiave rifiutata", e lo gestisce il dosatore delle quote.
+export const isKeyError = e => e instanceof ApiError && (
+  e.status === 401
+  || ([400, 403].includes(e.status)
+    && /API key not valid|API key expired|API_KEY_INVALID|API_KEY_SERVICE_BLOCKED|API_KEY_HTTP_REFERRER_BLOCKED|ACCESS_TOKEN_TYPE_UNSUPPORTED|CONSUMER_SUSPENDED|CONSUMER_INVALID|SERVICE_DISABLED|has not been used in project|it is disabled|suspended/i
+      .test(`${e.message} ${e.detail || ''}`))
+);
 
 /** Errori temporanei di Google: sovraccarico o limite di richieste. */
 export const isTransient = e => e instanceof ApiError && [429, 500, 502, 503, 504].includes(e.status);

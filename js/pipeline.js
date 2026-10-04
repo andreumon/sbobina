@@ -6,7 +6,7 @@
 // della lezione (vedi strategy.js) e l'elaborazione riprende con la variante che funziona.
 import * as store from './store.js';
 import { analyzeAdts, planChunks, probeDuration, sliceParts } from './aac.js';
-import { Gemini, ApiError, blobToBase64 } from './gemini.js';
+import { Gemini, ApiError, blobToBase64, isKeyError } from './gemini.js';
 import { transcriptionPrompt, revisionPrompt, continuationPrompt, langOf } from './prompts.js';
 import * as quota from './quota.js';
 import { paragraphsFromChunk, paragraphsFromRaw, completenessCheck, glossaryTerms, fmtTime, countWords, coverageWarnings } from './text.js';
@@ -23,6 +23,7 @@ export const FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-
 const GEN_CONFIG = { maxOutputTokens: 32768, thinkingLevel: 'low' };
 const MAX_INLINE_WAIT = 6 * 60_000;        // oltre questa attesa la lezione va "in attesa" e libera la coda
 const SWITCH_IF_WAIT = 2 * 60_000;         // se un modello va atteso più di così, si preferisce un altro libero
+const KEY_OFFLINE_PAUSE = 2 * 60_000;      // una chiave che non risponde (rete) si salta per 2 minuti
 
 /** Nessun modello disponibile adesso: la lezione si rimette in coda all'ora indicata. */
 export class BusyError extends Error {
@@ -59,7 +60,26 @@ export async function processJob(id, ctx) {
     ctx.log?.(msg);
     return store.updateJob(id, j => { j.log = [...(j.log || []).slice(-80), `${new Date().toLocaleTimeString('it-IT')} ${msg}`]; }, { touch: false });
   };
-  const gemini = new Gemini(settings.apiKey, { log, signal });
+  // ---- Chiavi API: la principale e, se impostata, quella di riserva.
+  // Ogni chiave (di un progetto Google diverso) ha quote proprie: quando la principale è
+  // satura su un modello, non risponde o viene rifiutata, si passa alla riserva.
+  const k1 = (settings.apiKey || '').trim();
+  const k2 = (settings.apiKey2 || '').trim();
+  const keys = [
+    // Con una riserva disponibile, la principale che non risponde si abbandona dopo 2 tentativi (~10 s) invece di 5 (~1,5 min)
+    k1 && { tag: '', name: 'chiave principale', gemini: new Gemini(k1, { log, signal, netRetries: k2 && k2 !== k1 ? 2 : 5 }) },
+    k2 && k2 !== k1 && { tag: 'k2', name: 'chiave di riserva', gemini: new Gemini(k2, { log, signal }) },
+  ].filter(Boolean);
+  if (!keys.length) throw new Error('Manca la chiave API Gemini: inseriscila nelle impostazioni.');
+  const deadKeys = new Set();     // chiavi rifiutate da Google in questa esecuzione
+  const offlineUntil = new Map(); // chiavi che non rispondono, saltate per qualche minuto
+  const keyOf = tag => keys.find(k => k.tag === tag);
+  const keyUp = k => !deadKeys.has(k.tag) && !((offlineUntil.get(k.tag) || 0) > Date.now());
+  const liveKeys = () => keys.filter(k => !deadKeys.has(k.tag));
+  let gemini = keys[0].gemini;    // client dell'ultima richiesta riuscita (per gemini.last)
+  let lastKeyTag = keys[0].tag;
+  // I file caricati su Google appartengono al progetto della chiave: si cancellano con la stessa chiave.
+  const dropRef = (refKey, g) => keyOf(quota.keyTagOf(refKey))?.gemini.deleteFile(g.name);
   const patch = fn => store.updateJob(id, fn);
   const progress = info => ctx.onProgress?.({ id, ...info });
   let strategy = loadStrategy();
@@ -103,7 +123,7 @@ export async function processJob(id, ctx) {
   const stale = job.chunks?.length && (job.planVersion || 1) < PLAN_VERSION && !job.chunks.some(c => typeof c.raw === 'string');
   if (stale) {
     await log('Ripianifico i blocchi con la versione aggiornata del taglio');
-    for (const g of [...Object.values(job.grefs || {}), ...job.chunks.flatMap(c => Object.values(c.grefs || {}))]) gemini.deleteFile(g.name);
+    for (const [k, g] of [...Object.entries(job.grefs || {}), ...job.chunks.flatMap(c => Object.entries(c.grefs || {}))]) dropRef(k, g);
     job = await patch(j => { j.chunks = []; delete j.grefs; });
   }
   if (!job.chunks?.length) await plan();
@@ -116,7 +136,7 @@ export async function processJob(id, ctx) {
 
   // ---- Audio da inviare per un blocco, nella forma richiesta dalla strategia
   const wavCache = new Map();
-  const audioFor = async (i, step) => {
+  const audioFor = async (i, step, k = keys[0]) => {
     const chunk = job.chunks[i];
     const { format, transport } = step;
     let blob, mime;
@@ -139,12 +159,13 @@ export async function processJob(id, ctx) {
       if (blob.size > INLINE_MAX_BYTES) throw new ApiError('Blocco troppo grande per l\'invio diretto: va ripianificato.', 413);
       return { data: await blobToBase64(blob), mimeType: mime };
     }
-    // Caricamento con la Files API, riusato finché il file non scade
-    const key = `${format}`;
+    // Caricamento con la Files API, riusato finché il file non scade (un file per chiave:
+    // un file caricato con una chiave non è visibile dal progetto dell'altra)
+    const key = quota.scoped(format, k.tag);
     const holder = chunk.mode === 'slice' ? chunk : job;
     const cached = holder.grefs?.[key];
     if (cached?.uri && Date.now() - (cached.at || 0) < GEMINI_FILE_TTL) return { uri: cached.uri, mimeType: mime };
-    const f = await gemini.upload(blob, mime, chunk.mode === 'slice' ? `${job.title} - parte ${i + 1}` : job.title,
+    const f = await k.gemini.upload(blob, mime, chunk.mode === 'slice' ? `${job.title} - parte ${i + 1}` : job.title,
       p => progress({ step: 'upload', chunk: i, total: job.chunks.length, progress: p }));
     const refData = { name: f.name, uri: f.uri, at: Date.now() };
     job = await patch(j => {
@@ -156,7 +177,7 @@ export async function processJob(id, ctx) {
 
   // ---- Dosatore: sceglie il modello, rispetta le quote, ricorda chi è esaurito o sovraccarico
   const chain = [settings.reviseModel, ...FALLBACK_MODELS.filter(m => m !== settings.reviseModel)];
-  const missing = new Set(); // modelli che non esistono per questa chiave (404)
+  const missing = new Set(); // modello@chiave che non esistono per quella chiave (404)
   const waitFor = async (ms, info) => {
     const until = Date.now() + ms;
     while (Date.now() < until) {
@@ -170,58 +191,89 @@ export async function processJob(id, ctx) {
    */
   const runStep = async ({ label, candidates, tokens, call, info }) => {
     const minuteHits = new Map();
+    // Ogni modello si prova prima con la chiave principale, poi con quella di riserva:
+    // così si cambia chiave prima di ripiegare su un modello peggiore.
+    const pairs = candidates.flatMap(c => keys.map(k => ({ ...c, key: k, qid: quota.scoped(c.model, k.tag) })));
+    const who = c => (keys.length > 1 ? `${c.model} (${c.key.name})` : c.model);
     for (;;) {
       if (signal?.aborted) throw new DOMException('Interrotto', 'AbortError');
-      const alive = candidates.filter(c => !missing.has(c.model) && (minuteHits.get(c.model) || 0) < 2);
+      const alive = pairs.filter(c => !deadKeys.has(c.key.tag) && !missing.has(c.qid) && (minuteHits.get(c.qid) || 0) < 2);
       if (!alive.length) throw new ApiError(`${label}: nessun modello utilizzabile.`, 503);
-      const ready = alive.filter(c => quota.usable(c.model));
+      const ready = alive.filter(c => keyUp(c.key) && quota.usable(c.qid));
       if (!ready.length) {
-        const at = Math.min(...alive.map(c => quota.availableAt(c.model)));
+        const at = Math.min(...alive.map(c => Math.max(quota.availableAt(c.qid), offlineUntil.get(c.key.tag) || 0)));
         const wait = at - Date.now();
         if (wait <= MAX_INLINE_WAIT) {
           await log(`${label}: tutti i modelli in pausa, riprovo tra ${Math.ceil(wait / 1000)} s`);
           await waitFor(wait, info);
           continue;
         }
-        const daily = at >= quota.quotaDay().resetAt - 120_000;
+        // "Quota finita" se tutti i modelli/chiavi in fila hanno esaurito la quota giornaliera, non solo una pausa
+        const daily = alive.every(c => quota.isExhausted(c.qid));
         throw new BusyError(daily
           ? 'Quota gratuita giornaliera esaurita su tutti i modelli disponibili.'
           : 'Google è sovraccarico su tutti i modelli disponibili.', at, daily);
       }
       let pick = ready[0];
-      let wait = quota.waitBefore(pick.model, tokens);
+      let wait = quota.waitBefore(pick.qid, tokens);
       if (wait > SWITCH_IF_WAIT) {
         for (const c of ready.slice(1)) {
-          const w = quota.waitBefore(c.model, tokens);
+          const w = quota.waitBefore(c.qid, tokens);
           if (w < wait) { pick = c; wait = w; }
           if (w === 0) break;
         }
       }
       if (wait > 0) {
-        await log(`${label}: attendo ${Math.ceil(wait / 1000)} s per restare nel limite al minuto di ${pick.model}`);
+        await log(`${label}: attendo ${Math.ceil(wait / 1000)} s per restare nel limite al minuto di ${who(pick)}`);
         await waitFor(wait, info);
       }
       try {
         const text = await call(pick);
-        quota.record(pick.model, tokens);
+        quota.record(pick.qid, tokens);
+        offlineUntil.delete(pick.key.tag);
+        gemini = pick.key.gemini;
+        if (pick.key.tag !== lastKeyTag) {
+          lastKeyTag = pick.key.tag;
+          await log(`${label}: ora uso la ${pick.key.name}`);
+        }
         return { text, model: pick.model };
       } catch (e) {
         if (e.name === 'AbortError') throw e;
-        const c = quota.onError(pick.model, e);
-        if (c.kind === 'daily') { await log(`${label}: ${pick.model} ha finito la quota gratuita di oggi (si azzera alle 9:00)`); continue; }
-        if (c.kind === 'minute') {
-          minuteHits.set(pick.model, (minuteHits.get(pick.model) || 0) + 1);
-          await log(`${label}: ${pick.model} al limite al minuto, lo rimetto in fila tra ${Math.ceil(c.waitMs / 1000)} s`);
+        const others = liveKeys().filter(k => k !== pick.key);
+        // Chiave rifiutata (non valida, revocata, progetto disattivato): si passa all'altra.
+        if (isKeyError(e) && others.length) {
+          deadKeys.add(pick.key.tag);
+          await log(`${label}: Google rifiuta la ${pick.key.name} (${e.message}), passo alla ${others[0].name}`);
           continue;
         }
-        if (c.kind === 'overload') { await log(`${label}: ${pick.model} sovraccarico, lo salto per qualche minuto`); continue; }
+        // Chiave che non risponde (errore di rete dopo i tentativi): si prova l'altra,
+        // ma solo se il dispositivo è online: senza rete cambiare chiave non serve.
+        const deviceOffline = globalThis.navigator?.onLine === false;
+        if (e instanceof ApiError && e.status === 0 && !deviceOffline && others.some(keyUp)) {
+          offlineUntil.set(pick.key.tag, Date.now() + KEY_OFFLINE_PAUSE);
+          await log(`${label}: la ${pick.key.name} non risponde, passo alla ${others.find(keyUp).name}`);
+          continue;
+        }
+        const c = quota.onError(pick.qid, e);
+        const next = () => (others.some(keyUp) && pick.key.tag === '' ? `; provo ${pick.model} con la chiave di riserva` : '');
+        if (c.kind === 'daily') {
+          const at = new Date(quota.availableAt(pick.qid)).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
+          await log(`${label}: ${who(pick)} ha finito la quota gratuita (torna disponibile alle ${at})${next()}`);
+          continue;
+        }
+        if (c.kind === 'minute') {
+          minuteHits.set(pick.qid, (minuteHits.get(pick.qid) || 0) + 1);
+          await log(`${label}: ${who(pick)} al limite al minuto (libero tra ${Math.ceil(c.waitMs / 1000)} s)${next()}`);
+          continue;
+        }
+        if (c.kind === 'overload') { await log(`${label}: ${who(pick)} sovraccarico, lo salto per qualche minuto`); continue; }
         if (e instanceof ApiError && [403, 404].includes(e.status) && pick.model !== candidates[0].model) {
-          missing.add(pick.model);
+          missing.add(pick.qid);
           continue;
         }
         if (e instanceof ApiError && [403, 404].includes(e.status) && pick.kind === 'transcribe') {
           await log(`Modello di trascrizione non disponibile (${e.message}); uso i modelli generali`);
-          missing.add(pick.model);
+          for (const k of keys) missing.add(quota.scoped(pick.model, k.tag));
           strategy = { ...strategy, transcribe: { ...strategy.transcribe, use: false } };
           saveStrategy(strategy);
           continue;
@@ -237,10 +289,19 @@ export async function processJob(id, ctx) {
     diagnosed = true;
     await log(`Google ha rifiutato la richiesta: ${cause.message}${cause.detail ? ` (${cause.detail})` : ''}. Avvio l'autodiagnosi.`);
     progress({ step: 'diagnose' });
-    const { strategy: found, results } = await diagnose(gemini, {
-      audio: job.chunks[0]?.mode === 'slice' ? audio : null, settings, vocabulary, onStep: label => progress({ step: 'diagnose', label }),
+    const clients = [...liveKeys().filter(keyUp), ...liveKeys().filter(k => !keyUp(k))].map(k => k.gemini);
+    const { strategy: found, results, quotaBlocked } = await diagnose(clients.length ? clients : [keys[0].gemini], {
+      audio: job.chunks[0]?.mode === 'slice' ? audio : null, settings, vocabulary, current: strategy,
+      onTransient: (g, model, e) => quota.onError(quota.scoped(model, keys.find(k => k.gemini === g)?.tag), e),
+      onStep: label => progress({ step: 'diagnose', label }),
     });
-    for (const r of results) await log(`Diagnosi: ${r.ok ? 'OK' : 'NO'}, ${r.label}${r.ok ? '' : `: ${r.error}`}`);
+    for (const r of results) await log(`Diagnosi: ${r.ok ? 'OK' : r.skipped ? '??' : 'NO'}, ${r.label}${r.ok ? '' : `: ${r.error}`}`);
+    if (!found && quotaBlocked) {
+      // Non è un rifiuto: la quota è finita durante la diagnosi. La lezione aspetta e riprova.
+      diagnosed = false;
+      const at = Math.min(...keys.map(k => quota.availableAt(quota.scoped(settings.reviseModel, k.tag))));
+      throw new BusyError('Quota esaurita durante l\'autodiagnosi: riprovo più tardi.', Math.max(at, Date.now() + 60_000), true);
+    }
     if (!found) {
       const first = results.find(r => !r.ok);
       throw new ApiError(`Nessuna variante della richiesta è stata accettata da Google. Primo errore: ${first?.error || cause.message}`, 400);
@@ -283,13 +344,13 @@ export async function processJob(id, ctx) {
         let { text: raw, model: engine } = await runStep({
           label: 'Trascrizione', candidates, tokens: quota.estimateTokens(secs), info,
           call: async c => {
-            progress({ step: 'transcribe', ...info, model: c.model });
+            progress({ step: 'transcribe', ...info, model: c.model, reserve: c.key.tag !== '' });
             if (c.kind === 'transcribe') {
-              const a = await audioFor(i, strategy.transcribe);
-              return gemini.transcribe({ model: c.model, audio: a, language: lang.codes, vocabulary: strategy.transcribe.vocab ? vocabulary : [], maxOutputTokens: 32768 });
+              const a = await audioFor(i, strategy.transcribe, c.key);
+              return c.key.gemini.transcribe({ model: c.model, audio: a, language: lang.codes, vocabulary: strategy.transcribe.vocab ? vocabulary : [], maxOutputTokens: 32768 });
             }
-            const a = await audioFor(i, strategy.revise);
-            return gemini.generate({ model: c.model, audio: a, endpoint: strategy.revise.endpoint, label: 'Trascrizione', config: GEN_CONFIG,
+            const a = await audioFor(i, strategy.revise, c.key);
+            return c.key.gemini.generate({ model: c.model, audio: a, endpoint: strategy.revise.endpoint, label: 'Trascrizione', config: GEN_CONFIG,
               prompt: transcriptionPrompt({ course: job.course, glossary: glossaryText, range, lang }) });
           },
         });
@@ -300,14 +361,14 @@ export async function processJob(id, ctx) {
           const tail = raw.replace(/\s+/g, ' ').slice(-300);
           const { text: more } = await runStep({
             label: 'Trascrizione', candidates: chain.map(model => ({ model, kind: 'generate' })), tokens: quota.estimateTokens(secs), info,
-            call: async c => gemini.generate({ model: c.model, audio: await audioFor(i, strategy.revise), endpoint: strategy.revise.endpoint,
+            call: async c => c.key.gemini.generate({ model: c.model, audio: await audioFor(i, strategy.revise, c.key), endpoint: strategy.revise.endpoint,
               label: 'Trascrizione', config: GEN_CONFIG, prompt: continuationPrompt({ course: job.course, glossary: glossaryText, tail, lang }) }),
           });
           if (!stripFences(more)) break;
           raw = `${raw}\n\n${stripFences(more)}`;
         }
         const words = countWords(raw);
-        await log(`Blocco ${i + 1}: trascritte ${words} parole in ${fmtTime(secs)} (${Math.round(words / Math.max(0.1, secs / 60))} al minuto) con ${engine}`);
+        await log(`Blocco ${i + 1}: trascritte ${words} parole in ${fmtTime(secs)} (${Math.round(words / Math.max(0.1, secs / 60))} al minuto) con ${engine}${lastKeyTag ? ' (chiave di riserva)' : ''}`);
         if (!raw) await log(`Blocco ${i + 1}: nessun parlato riconosciuto`);
         job = await patch(j => { Object.assign(j.chunks[i], { raw, engine }); });
         chunk = job.chunks[i];
@@ -327,9 +388,9 @@ export async function processJob(id, ctx) {
           label: 'Revisione', candidates: chain.map(m => ({ model: m, kind: 'generate' })),
           tokens: quota.estimateTokens(withAudio ? chunk.end - chunk.start : 0, prompt.length), info,
           call: async c => {
-            progress({ step: 'revise', ...info, model: c.model });
-            const a = withAudio ? await audioFor(i, strategy.revise) : null;
-            return gemini.generate({ model: c.model, prompt, audio: a, endpoint: strategy.revise.endpoint, label: 'Revisione', config: GEN_CONFIG });
+            progress({ step: 'revise', ...info, model: c.model, reserve: c.key.tag !== '' });
+            const a = withAudio ? await audioFor(i, strategy.revise, c.key) : null;
+            return c.key.gemini.generate({ model: c.model, prompt, audio: a, endpoint: strategy.revise.endpoint, label: 'Revisione', config: GEN_CONFIG });
           },
         });
         const revised = stripFences(text);
@@ -343,7 +404,7 @@ export async function processJob(id, ctx) {
         if (withAudio) warns.push(...coverageWarnings(paragraphs, chunk.start, chunk.end, job.duration));
         const warn = warns.join(' ') || null;
         if (warn) await log(`Blocco ${i + 1}: ${warn}`);
-        if (model !== settings.reviseModel) await log(`Blocco ${i + 1}: rivisto con ${model}`);
+        if (model !== settings.reviseModel || lastKeyTag) await log(`Blocco ${i + 1}: rivisto con ${model}${lastKeyTag ? ' (chiave di riserva)' : ''}`);
         job = await patch(j => { Object.assign(j.chunks[i], { revised, paragraphs, ratio: check.ratio, warn, reviseEngine: model }); });
       } else {
         job = await patch(j => { const c = j.chunks[i]; c.paragraphs = paragraphsFromRaw(c.raw || '', c.start); });
@@ -359,14 +420,14 @@ export async function processJob(id, ctx) {
 
     // Pulizia dei file temporanei su Google per questo blocco
     if (chunk.mode === 'slice' && job.chunks[i].grefs) {
-      for (const g of Object.values(job.chunks[i].grefs)) await gemini.deleteFile(g.name);
+      for (const [k, g] of Object.entries(job.chunks[i].grefs)) await dropRef(k, g);
       job = await patch(j => { delete j.chunks[i].grefs; delete j.chunks[i].gfile; });
     }
     wavCache.delete(i);
     ctx.onChunkDone?.(job, i);
   }
 
-  for (const g of Object.values(job.grefs || {})) await gemini.deleteFile(g.name);
+  for (const [k, g] of Object.entries(job.grefs || {})) await dropRef(k, g);
   job = await patch(j => {
     j.status = 'done'; j.finishedAt = Date.now(); j.error = null; delete j.grefs; delete j.gfile; delete j.runner;
   });

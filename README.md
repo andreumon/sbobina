@@ -25,6 +25,7 @@ Ti servono un account Google e un account GitHub (gratuito).
 
 1. Vai su [aistudio.google.com/apikey](https://aistudio.google.com/apikey) con il tuo account Google.
 2. Premi **Create API key** e copia la chiave. Dal 28 maggio 2026 le chiavi nuove iniziano con `AQ.`: sono le nuove "chiavi di autenticazione" di Google, e vanno benissimo. Le vecchie chiavi iniziavano con `AIza`.
+   *Facoltativo:* crea una seconda chiave in un **altro progetto** Google e incollala in *Impostazioni → Chiave di riserva*. Sbobina la usa da sola quando la principale ha finito la quota, non risponde o viene rifiutata (le quote gratuite sono per progetto: una seconda chiave dello stesso progetto non aggiunge quota).
 3. La inserirai nell'app al primo avvio, in *Impostazioni → Gemini*. Basta farlo su un dispositivo: poi viaggia via Drive.
 
 ### 2. Pubblica il sito su GitHub Pages (5 minuti)

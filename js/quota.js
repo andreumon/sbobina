@@ -19,6 +19,12 @@ const DEFAULT_LIMITS = { rpm: 5, tpm: 250_000, rpd: null };
 const OVERLOAD_COOLDOWN = 5 * 60_000; // dopo un 503 il modello si ritenta solo dopo 5 minuti
 
 const KEY = 'sbobina.quota';
+
+// Con più chiavi API le quote sono separate: lo stato di un modello usato con la chiave
+// di riserva si salva come "modello@k2". La chiave principale resta senza suffisso.
+export const scoped = (model, tag = '') => (tag ? `${model}@${tag}` : model);
+export const baseModel = id => String(id).split('@')[0];
+export const keyTagOf = id => String(id).split('@')[1] || '';
 const now = () => Date.now();
 
 /** Giorno di quota corrente (data del Pacifico) e istante del prossimo azzeramento. */
@@ -38,6 +44,11 @@ function load() {
   const { day } = quotaDay();
   if (s.day !== day) s = { day, models: Object.fromEntries(Object.entries(s.models || {}).map(([m, v]) => [m, { learned: v.learned, calls: v.calls || [] }])) };
   s.models = s.models || {};
+  // Quota giornaliera esaurita con un orario di ripristino indicato da Google ("Please retry in 2h21m"):
+  // passato quell'orario il modello torna utilizzabile, senza aspettare la mezzanotte del Pacifico.
+  for (const e of Object.values(s.models)) {
+    if (e.exhaustedUntil && e.exhaustedUntil <= now()) { delete e.exhausted; delete e.exhaustedUntil; e.used = 0; }
+  }
   return s;
 }
 function save(s) { localStorage.setItem(KEY, JSON.stringify(s)); }
@@ -51,7 +62,7 @@ function entry(s, model) {
 }
 
 export function limitsOf(model, s = load()) {
-  return { ...DEFAULT_LIMITS, ...(KNOWN_LIMITS[model] || {}), ...(s.models[model]?.learned || {}) };
+  return { ...DEFAULT_LIMITS, ...(KNOWN_LIMITS[baseModel(model)] || {}), ...(s.models[model]?.learned || {}) };
 }
 
 /** Il modello si può usare adesso? (non esaurito oggi, non in pausa per sovraccarico) */
@@ -65,13 +76,23 @@ export function usable(model) {
   return !(e.cooldownUntil > now());
 }
 
+/** Il modello ha finito la quota giornaliera (non è solo in pausa per qualche minuto)? */
+export function isExhausted(model) {
+  const s = load();
+  const e = s.models[model];
+  if (!e) return false;
+  const lim = limitsOf(model, s);
+  return !!e.exhausted || !!(lim.rpd && e.used >= lim.rpd);
+}
+
 /** Quando il modello tornerà disponibile (ms epoch). */
 export function availableAt(model) {
   const s = load();
   const e = s.models[model];
   if (!e) return now();
   const lim = limitsOf(model, s);
-  if (e.exhausted || (lim.rpd && e.used >= lim.rpd)) return quotaDay().resetAt;
+  if (e.exhausted) return e.exhaustedUntil || quotaDay().resetAt;
+  if (lim.rpd && e.used >= lim.rpd) return quotaDay().resetAt;
   return Math.max(now(), e.cooldownUntil || 0);
 }
 
@@ -107,6 +128,13 @@ export function record(model, tokens) {
   save(s);
 }
 
+/** "Please retry in 2h21m49.6s" → millisecondi (NaN se assente). */
+export function retryFromText(msg) {
+  const m = /retry in\s+(?:(\d+)h)?\s*(?:(\d+)m(?!s))?\s*(?:([\d.]+)s)?/i.exec(String(msg || ''));
+  if (!m || !(m[1] || m[2] || m[3])) return NaN;
+  return ((+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (parseFloat(m[3]) || 0)) * 1000;
+}
+
 /**
  * Classifica un errore di Google e aggiorna lo stato del modello.
  * @returns {{kind: 'daily'|'minute'|'overload'|'other', waitMs?: number}}
@@ -120,7 +148,8 @@ export function onError(model, err) {
     const details = err.body?.error?.details || [];
     const violations = details.flatMap(d => d.violations || []);
     const retry = details.find(d => String(d['@type'] || '').includes('RetryInfo'));
-    const retryMs = retry ? parseFloat(retry.retryDelay) * 1000 : NaN;
+    let retryMs = retry ? parseFloat(retry.retryDelay) * 1000 : NaN;
+    if (!Number.isFinite(retryMs)) retryMs = retryFromText(err.message);
     const ids = violations.map(v => `${v.quotaId || ''} ${v.quotaMetric || ''}`).join(' ');
     const daily = /PerDay|per_day|requests_per_day/i.test(ids) || /per day|daily/i.test(err.message);
     // Impara il limite reale se Google lo comunica
@@ -134,6 +163,9 @@ export function onError(model, err) {
     }
     if (daily) {
       e.exhausted = true;
+      // Google dice tra quanto riprovare: se è prima della mezzanotte del Pacifico, si usa quello.
+      if (Number.isFinite(retryMs) && now() + retryMs < quotaDay().resetAt) e.exhaustedUntil = now() + retryMs + 30_000;
+      else delete e.exhaustedUntil;
       out = { kind: 'daily' };
     } else {
       const waitMs = Number.isFinite(retryMs) ? retryMs + 1500 : 60_000;
