@@ -5,7 +5,7 @@ import { DRIVE_CLIENT_ID } from './config.js';
 import { Drive, DriveAuthError } from './drive.js';
 import { Sync } from './sync.js';
 import { Player } from './player.js';
-import { processJob } from './pipeline.js';
+import { processJob, BusyError } from './pipeline.js';
 import { Gemini, explainError } from './gemini.js';
 import { guessMime, cleanForPlayback } from './aac.js';
 import { diagnose, describeStrategy, saveStrategy, resetStrategy, loadStrategy } from './strategy.js';
@@ -114,6 +114,7 @@ function stateLabel(job) {
     case 'running':
       return job.runner === store.deviceId ? { text: 'In coda', cls: '' } : { text: 'In elaborazione su un altro dispositivo', cls: '' };
     case 'paused': return { text: 'In pausa', cls: '' };
+    case 'waiting': return { text: 'In attesa: Google è sovraccarico', cls: '' };
     case 'error': return { text: 'Interrotta', cls: 'err' };
     default: return null;
   }
@@ -134,7 +135,7 @@ function lectureRow(job) {
   return `<li><button type="button" class="row-btn" data-id="${job.id}"${job.id === state.jobId ? ' aria-current="true"' : ''}>
     <span class="l-title">${esc(job.title)}</span>
     <span class="l-meta">${esc(meta)}${extra ? `<br>${extra}` : ''}</span>
-  </button></li>`;
+  </button><button type="button" class="row-more" data-id="${job.id}" aria-label="Altre azioni per ${esc(job.title)}">⋯</button></li>`;
 }
 
 /** Corsi noti: quelli salvati più quelli che compaiono solo nelle lezioni (es. creati su un altro dispositivo). */
@@ -293,16 +294,21 @@ function fillMoveSelect(job) {
     names.map(n => `<option${n === job.course ? ' selected' : ''}>${esc(n)}</option>`).join('');
 }
 $('moveSel').addEventListener('change', async () => {
-  const course = $('moveSel').value;
-  await store.updateJob(state.jobId, j => { j.course = course; });
   $('moveRow').hidden = true;
+  await moveLecture(state.jobId, $('moveSel').value);
+});
+
+async function moveLecture(id, course) {
+  await store.updateJob(id, j => { j.course = course; });
   const closed = new Set(store.device.get('closedFolders', []));
   closed.delete(course);
   store.device.set('closedFolders', [...closed]);
   toast(course ? `Spostata in ${course}` : 'Spostata in Senza corso');
   renderList();
+  if (state.view === 'course') openCourse(state.courseName, { push: false });
+  if (state.jobId === id) renderLecture();
   sync.run();
-});
+}
 
 // ====================================================================
 // Nuova trascrizione
@@ -472,10 +478,25 @@ async function keepAwake(on) {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     if (state.runner) keepAwake(true);
+    scheduleWakeups();
     checkInbox();
     if (drive.connected && Date.now() - sync.lastRun > 30_000) sync.run();
   }
 });
+
+/** Rimette in coda le lezioni "in attesa" quando è il momento di riprovare. */
+let wakeTimer;
+async function scheduleWakeups() {
+  clearTimeout(wakeTimer);
+  const waiting = (await store.listJobs()).filter(j => j.status === 'waiting' && (!j.runner || j.runner === store.deviceId));
+  if (!waiting.length) return;
+  const now = Date.now();
+  const due = waiting.filter(j => (j.retryAt || 0) <= now);
+  for (const j of due) await store.updateJob(j.id, x => { x.status = 'queued'; x.error = null; });
+  if (due.length) runQueue();
+  const next = Math.min(...waiting.filter(j => (j.retryAt || 0) > now).map(j => j.retryAt));
+  if (Number.isFinite(next)) wakeTimer = setTimeout(scheduleWakeups, Math.max(5_000, next - now + 1_000));
+}
 
 async function runQueue() {
   if (state.runner) return;
@@ -501,12 +522,15 @@ async function runQueue() {
       autoSaveToFolder(done);
     } catch (e) {
       const paused = e.name === 'AbortError';
+      const busy = e instanceof BusyError;
       if (!paused) console.error(e);
       await store.updateJob(job.id, j => {
-        j.status = paused ? 'paused' : 'error';
-        j.error = paused ? null : explainError(e);
-        delete j.runner;
+        j.status = paused ? 'paused' : busy ? 'waiting' : 'error';
+        j.error = paused ? null : explainError(busy ? e.cause : e);
+        j.retryAt = busy ? Date.now() + e.retryAfterMs : null;
+        if (busy) j.runner = store.deviceId; else delete j.runner;
       });
+      if (busy) scheduleWakeups();
     } finally {
       delete state.progress[job.id];
       state.runner = null;
@@ -637,6 +661,10 @@ function renderStatus(job) {
     } else if (job.status === 'error') {
       text = job.error || 'Elaborazione interrotta.';
       actions = '<button type="button" class="btn" data-run="resume">Riprendi</button>';
+    } else if (job.status === 'waiting') {
+      const at = new Date(job.retryAt || Date.now()).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
+      text = `Google è sovraccarico o ha esaurito la quota gratuita per ora. Riprovo da solo alle ${at}, con l'app aperta.`;
+      actions = '<button type="button" class="btn" data-run="resume">Riprova ora</button>';
     } else if (job.status === 'paused') {
       text = 'Elaborazione in pausa.';
       actions = '<button type="button" class="btn" data-run="resume">Riprendi</button>';
@@ -813,14 +841,21 @@ function startRename() {
 }
 
 // Azioni: copia, salva, condividi, modifica, elimina.
-$('lecActions').addEventListener('click', async e => {
+$('lecActions').addEventListener('click', e => {
   const b = e.target.closest('[data-act]');
-  if (!b) return;
-  const job = await store.getJob(state.jobId);
+  if (b && state.jobId) lectureAction(b.dataset.act, state.jobId, 'page');
+});
+
+/** Azioni su una lezione, dalla sua pagina o dal menu (pressione prolungata, tasto destro, ⋯). */
+async function lectureAction(act, id, from = 'menu') {
+  const job = await store.getJob(id);
   if (!job) return;
   const md = toMarkdown(job);
   const name = `${safeFileName(job.title)}.md`;
-  switch (b.dataset.act) {
+  switch (act) {
+    case 'open':
+      openLecture(id);
+      break;
     case 'copy':
       try { await navigator.clipboard.writeText(md); toast('Testo copiato'); } catch { toast('Copia non riuscita'); }
       break;
@@ -842,17 +877,38 @@ $('lecActions').addEventListener('click', async e => {
       } catch (err) { if (err.name !== 'AbortError') toast('Condivisione non riuscita'); }
       break;
     }
+    case 'rename':
+      if (from === 'page') { startRename(); break; }
+      openSheet(`
+        <form class="sheet-form" data-form="rename">
+          <label for="sheetInput">Nuovo titolo</label>
+          <input id="sheetInput" value="${esc(job.title)}">
+          <div class="form-actions"><button type="submit" class="primary">Rinomina</button><button type="button" class="quiet" data-close>Annulla</button></div>
+        </form>`, { id, keep: true });
+      $('sheetInput').select();
+      break;
     case 'move':
-      fillMoveSelect(job);
-      $('moveRow').hidden = !$('moveRow').hidden;
-      if (!$('moveRow').hidden) $('moveSel').focus();
+      if (from === 'page') {
+        fillMoveSelect(job);
+        $('moveRow').hidden = !$('moveRow').hidden;
+        if (!$('moveRow').hidden) $('moveSel').focus();
+        break;
+      }
+      openSheet(`<p class="sheet-title">Sposta in</p>` +
+        ['', ...allCourseNames(await store.listJobs())].map(c => `<button type="button" class="sheet-item" data-move="${esc(c)}"${c === (job.course || '') ? ' aria-current="true"' : ''}>${esc(c || 'Senza corso')}</button>`).join(''), { id, keep: true });
       break;
     case 'edit':
+      if (state.jobId !== id || state.view !== 'lecture') await openLecture(id);
       state.editing = true;
-      $('editor').value = toEditable(job);
+      $('editor').value = toEditable(await store.getJob(id));
       $('resetEdit').hidden = !job.edited;
-      renderLecture(job);
+      renderLecture();
       $('editor').focus();
+      break;
+    case 'resume':
+      await store.updateJob(id, j => { j.status = 'queued'; j.runner = store.deviceId; j.error = null; j.retryAt = null; });
+      runQueue();
+      toast('Elaborazione ripresa');
       break;
     case 'delete': {
       const onDrive = !!(job._sync?.dataId || job.remote?.audioId);
@@ -866,13 +922,132 @@ $('lecActions').addEventListener('click', async e => {
       if (state.runner?.id === job.id) state.runner.abort.abort();
       try { await sync.removeRemote(job); } catch (err) { toast(`Drive: ${err.message}`, 4000); return; }
       await store.removeJob(job.id);
-      show('home');
+      if (state.jobId === job.id) show('home');
       renderList();
       toast('Lezione eliminata');
       break;
     }
   }
+}
+
+// ---------- Menu della lezione ----------
+
+function openSheet(html, { id, x, y, keep = false } = {}) {
+  const sheet = $('sheet');
+  sheet.innerHTML = html;
+  sheet.dataset.id = id || '';
+  sheet.hidden = false;
+  $('sheetBackdrop').hidden = false;
+  const desktop = x !== undefined;
+  sheet.classList.toggle('popover', desktop);
+  $('sheetBackdrop').classList.toggle('clear', desktop);
+  if (desktop) {
+    const r = sheet.getBoundingClientRect();
+    sheet.style.left = `${Math.min(x, innerWidth - r.width - 8)}px`;
+    sheet.style.top = `${Math.min(y, innerHeight - r.height - 8)}px`;
+  } else if (!keep) {
+    sheet.style.left = sheet.style.top = '';
+  }
+  if (!keep) sheet.querySelector('button')?.focus({ preventScroll: true });
+}
+
+function closeSheet() {
+  $('sheet').hidden = true;
+  $('sheetBackdrop').hidden = true;
+}
+
+async function openLectureMenu(id, pos = {}) {
+  const job = await store.getJob(id);
+  if (!job) return;
+  const hasText = (job.chunks || []).some(c => c.raw) || !!job.edited;
+  const canResume = ['error', 'paused', 'waiting'].includes(job.status);
+  const items = [
+    ['open', 'Apri'],
+    ...(canResume ? [['resume', 'Riprendi elaborazione']] : []),
+    ['rename', 'Rinomina'],
+    ['move', 'Sposta in un altro corso'],
+    ...(hasText ? [['edit', 'Modifica testo'], ['copy', 'Copia testo'], ['save', 'Salva .md'], ...(navigator.share ? [['share', 'Condividi']] : [])] : []),
+    ['delete', 'Elimina'],
+  ];
+  if ('vibrate' in navigator && pos.x === undefined) navigator.vibrate?.(12);
+  openSheet(`<p class="sheet-title">${esc(job.title)}</p>` +
+    items.map(([a, label]) => `<button type="button" class="sheet-item${a === 'delete' ? ' danger' : ''}" data-act="${a}">${label}</button>`).join(''),
+  { id, ...pos });
+}
+
+$('sheetBackdrop').addEventListener('click', closeSheet);
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('sheet').hidden) closeSheet(); });
+$('sheet').addEventListener('click', async e => {
+  const id = $('sheet').dataset.id;
+  if (e.target.closest('[data-close]')) { closeSheet(); return; }
+  const mv = e.target.closest('[data-move]');
+  if (mv) {
+    closeSheet();
+    await moveLecture(id, mv.dataset.move);
+    return;
+  }
+  const b = e.target.closest('[data-act]');
+  if (!b) return;
+  const act = b.dataset.act;
+  if (act !== 'rename' && act !== 'move') closeSheet();
+  lectureAction(act, id, 'menu');
 });
+$('sheet').addEventListener('submit', async e => {
+  e.preventDefault();
+  const id = $('sheet').dataset.id;
+  const v = $('sheetInput')?.value.trim();
+  closeSheet();
+  if (!v) return;
+  await store.updateJob(id, j => { j.title = v; });
+  if (state.jobId === id) $('lecTitle').textContent = v;
+  refreshList();
+  sync.run();
+  toast('Lezione rinominata');
+});
+
+// Pressione prolungata (telefono), tasto destro e pulsante ⋯ (PC) sulle righe delle lezioni.
+let pressTimer = null, pressStart = null, suppressClick = false;
+function bindRowMenus(container) {
+  container.addEventListener('pointerdown', e => {
+    suppressClick = false; // nuovo gesto
+    const row = e.target.closest('.row-btn');
+    if (!row || e.pointerType === 'mouse') return;
+    pressStart = { x: e.clientX, y: e.clientY };
+    clearTimeout(pressTimer);
+    pressTimer = setTimeout(() => {
+      suppressClick = true;
+      openLectureMenu(row.dataset.id);
+    }, 480);
+  });
+  const cancel = e => {
+    if (!pressTimer) return;
+    if (e.type === 'pointermove' && pressStart && Math.hypot(e.clientX - pressStart.x, e.clientY - pressStart.y) < 10) return;
+    clearTimeout(pressTimer);
+    pressTimer = null;
+  };
+  container.addEventListener('pointermove', cancel);
+  container.addEventListener('pointerup', cancel);
+  container.addEventListener('pointercancel', cancel);
+  container.addEventListener('contextmenu', e => {
+    const row = e.target.closest('.row-btn');
+    if (!row) return;
+    e.preventDefault();
+    if (suppressClick) return; // il menu è già aperto dalla pressione prolungata
+    const touch = e.pointerType ? e.pointerType !== 'mouse' : !matchMedia('(pointer: fine)').matches;
+    openLectureMenu(row.dataset.id, touch ? {} : { x: e.clientX, y: e.clientY });
+  });
+  container.addEventListener('click', e => {
+    if (suppressClick) { e.stopImmediatePropagation(); e.preventDefault(); suppressClick = false; return; }
+    const more = e.target.closest('.row-more');
+    if (more) {
+      e.stopImmediatePropagation();
+      const r = more.getBoundingClientRect();
+      openLectureMenu(more.dataset.id, { x: r.left - 160, y: r.bottom + 4 });
+    }
+  }, true);
+}
+bindRowMenus($('lectureList'));
+bindRowMenus($('courseLectures'));
 
 function download(name, text) {
   const url = URL.createObjectURL(new Blob([text], { type: 'text/markdown;charset=utf-8' }));
@@ -1213,7 +1388,9 @@ async function start() {
 
   runQueue();
   if (drive.connected) sync.run();
+  scheduleWakeups();
   setInterval(() => {
+    scheduleWakeups();
     if (document.visibilityState === 'visible' && drive.connected && !sync.running) sync.run();
     if (state.jobId) renderStatus();
   }, 60_000);

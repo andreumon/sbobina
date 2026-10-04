@@ -81,7 +81,7 @@ export class Gemini {
     this.legacy = false;
   }
 
-  async call(path, init = {}, { retries = 6, label = 'Gemini' } = {}) {
+  async call(path, init = {}, { retries = 6, label = 'Gemini', overloadRetries = 6 } = {}) {
     const url = path.startsWith('http') ? path : GEMINI_BASE + path;
     for (let attempt = 0; ; attempt++) {
       let res;
@@ -100,7 +100,8 @@ export class Gemini {
       const msg = body?.error?.message || `HTTP ${res.status}`;
       const retryable = [429, 500, 502, 503, 504].includes(res.status);
       const hint = retryDelayMs(body);
-      if (retryable && attempt < retries && !(hint && hint > 5 * 60_000)) {
+      const limit = res.status === 503 ? Math.min(retries, overloadRetries) : retries;
+      if (retryable && attempt < limit && !(hint && hint > 5 * 60_000)) {
         await this.backoff(attempt, hint, label, res.status === 429 ? 'limite di richieste' : `errore ${res.status}`);
         continue;
       }
@@ -204,10 +205,10 @@ export class Gemini {
   }
 
   /** Chiamata alla Interactions API, con attesa se la risposta è asincrona. */
-  async interact(body, label) {
+  async interact(body, label, opts = {}) {
     let { body: out } = await this.call('/v1beta/interactions', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    }, { label });
+    }, { label, ...opts });
     const pending = ['in_progress', 'queued', 'pending', 'running', 'processing'];
     for (let i = 0; out?.id && pending.includes(String(out.status).toLowerCase()); i++) {
       if (i > 400) throw new ApiError('Il modello non ha risposto in tempo.', 0);
@@ -219,6 +220,7 @@ export class Gemini {
     if (['failed', 'cancelled', 'canceled'].includes(st)) {
       throw new ApiError(out?.error?.message || 'Il modello non ha completato la richiesta.', 500, out);
     }
+    this.last = { status: st, truncated: st === 'incomplete', usage: out?.usage || null };
     return extractText(out);
   }
 
@@ -226,14 +228,34 @@ export class Gemini {
    * Richiesta multimodale (audio opzionale + testo).
    * audio: { uri, mimeType } dopo un caricamento, oppure { data, mimeType } in base64.
    * endpoint: 'interactions' (predefinito) o 'generate' (generateContent).
+   * config: { maxOutputTokens, thinkingLevel } facoltativi; se Google li rifiuta si riprova senza.
    */
-  async generate({ model, prompt, audio, label, endpoint = 'interactions' }) {
+  async generate({ model, prompt, audio, label, endpoint = 'interactions', config, overloadRetries }) {
+    const opts = overloadRetries === undefined ? {} : { overloadRetries };
+    const useCfg = config && !this.noConfig;
+    try {
+      return await this.generateOnce({ model, prompt, audio, label, endpoint, config: useCfg ? config : null, opts });
+    } catch (e) {
+      if (!useCfg || e.status !== 400) throw e;
+      this.log(`${label}: parametri di generazione rifiutati (${e.message}), riprovo senza`);
+      this.noConfig = true;
+      return this.generateOnce({ model, prompt, audio, label, endpoint, config: null, opts });
+    }
+  }
+
+  async generateOnce({ model, prompt, audio, label, endpoint, config, opts }) {
     if (endpoint === 'interactions' && !this.legacy) {
       const input = [];
       if (audio) input.push(audioItem(audio));
       input.push({ type: 'text', text: prompt });
+      const body = { model, input };
+      if (config) {
+        body.generation_config = {};
+        if (config.maxOutputTokens) body.generation_config.max_output_tokens = config.maxOutputTokens;
+        if (config.thinkingLevel) body.generation_config.thinking_level = config.thinkingLevel;
+      }
       try {
-        return await this.interact({ model, input }, label);
+        return await this.interact(body, label, opts);
       } catch (e) {
         if (e.status !== 404 || /model/i.test(e.message)) throw e;
         this.log('Interactions API non disponibile, uso generateContent');
@@ -243,21 +265,35 @@ export class Gemini {
     const parts = [];
     if (audio) parts.push(audioPart(audio));
     parts.push({ text: prompt });
+    const req = { contents: [{ role: 'user', parts }] };
+    if (config?.maxOutputTokens) req.generationConfig = { maxOutputTokens: config.maxOutputTokens };
     const { body } = await this.call(`/v1beta/models/${model}:generateContent`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ role: 'user', parts }] }),
-    }, { label });
+      body: JSON.stringify(req),
+    }, { label, ...opts });
+    const finish = body?.candidates?.[0]?.finishReason;
+    this.last = { status: finish, truncated: finish === 'MAX_TOKENS', usage: body?.usageMetadata || null };
     return extractText(body);
   }
 
   /** Trascrizione con il modello dedicato (gemini-3.5-transcribe). */
-  transcribe({ model, audio, language, vocabulary }) {
+  async transcribe({ model, audio, language, vocabulary, maxOutputTokens, overloadRetries }) {
     const cfg = {};
     if (language) cfg.language_codes = [language];
     if (vocabulary?.length) cfg.custom_vocabulary = vocabulary;
     const body = { model, input: [audioItem(audio)] };
     if (Object.keys(cfg).length) body.generation_config = { transcription_config: cfg };
-    return this.interact(body, 'Trascrizione');
+    const opts = overloadRetries === undefined ? {} : { overloadRetries };
+    if (maxOutputTokens && !this.noConfig) {
+      try {
+        return await this.interact({ ...body, generation_config: { ...(body.generation_config || {}), max_output_tokens: maxOutputTokens } }, 'Trascrizione', opts);
+      } catch (e) {
+        if (e.status !== 400) throw e;
+        this.log(`Trascrizione: limite di lunghezza rifiutato (${e.message}), riprovo senza`);
+        this.noConfig = true;
+      }
+    }
+    return this.interact(body, 'Trascrizione', opts);
   }
 }
 
@@ -276,5 +312,8 @@ export function extractText(r) {
   if (!texts.length) {
     for (const c of r.candidates || []) for (const p of c?.content?.parts || []) if (p.text && !p.thought) texts.push(p.text);
   }
-  return texts.join('').trim();
+  return texts.reduce((acc, t) => (acc && !/\s$/.test(acc) && !/^\s/.test(t) ? `${acc} ${t}` : acc + t), '').trim();
 }
+
+/** Errori temporanei di Google: sovraccarico o limite di richieste. */
+export const isTransient = e => e instanceof ApiError && [429, 500, 502, 503, 504].includes(e.status);

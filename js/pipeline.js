@@ -6,16 +6,24 @@
 // della lezione (vedi strategy.js) e l'elaborazione riprende con la variante che funziona.
 import * as store from './store.js';
 import { analyzeAdts, planChunks, probeDuration, sliceParts } from './aac.js';
-import { Gemini, ApiError, blobToBase64 } from './gemini.js';
-import { transcriptionPrompt, revisionPrompt } from './prompts.js';
-import { paragraphsFromChunk, paragraphsFromRaw, completenessCheck, glossaryTerms, fmtTime } from './text.js';
+import { Gemini, ApiError, blobToBase64, isTransient } from './gemini.js';
+import { transcriptionPrompt, revisionPrompt, continuationPrompt } from './prompts.js';
+import { paragraphsFromChunk, paragraphsFromRaw, completenessCheck, glossaryTerms, fmtTime, countWords } from './text.js';
 import {
   loadStrategy, saveStrategy, diagnose, describeStrategy, maxChunkSec, toWav16k, isRequestShapeError, INLINE_MAX_BYTES,
 } from './strategy.js';
 
 const GEMINI_FILE_TTL = 46 * 3600 * 1000; // Google li tiene 48 ore
 const MAX_REQUEST_SEC = 54 * 60;           // limite del modello di trascrizione: 1 ora
-const PLAN_VERSION = 2;                    // 2: esclude il frame finto iniziale del registratore
+const PLAN_VERSION = 2;
+// Modelli gratuiti di riserva, provati in ordine quando quello scelto è sovraccarico.
+export const FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash'];
+const REVISE_CONFIG = { maxOutputTokens: 32768, thinkingLevel: 'low' };
+
+/** Google è sovraccarico su tutti i modelli: la lezione va rimessa in coda più tardi. */
+export class BusyError extends Error {
+  constructor(cause) { super(cause.message); this.cause = cause; this.retryAfterMs = cause.status === 429 ? 15 * 60_000 : 8 * 60_000; }
+}                    // 2: esclude il frame finto iniziale del registratore
 
 function stripFences(t) {
   return String(t || '').replace(/^\s*```[a-z]*\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
@@ -132,6 +140,30 @@ export async function processJob(id, ctx) {
     return { uri: f.uri, mimeType: mime }; // tipo canonico, non quello restituito dal server
   };
 
+  // ---- Modelli di riserva: se quello scelto è sovraccarico (503) o ha finito la quota (429)
+  const chain = [settings.reviseModel, ...FALLBACK_MODELS.filter(m => m !== settings.reviseModel)];
+  const unavailable = new Set();
+  const withModels = async (label, fn) => {
+    let lastErr;
+    for (const model of chain) {
+      if (unavailable.has(model)) continue;
+      try {
+        const text = await fn(model);
+        return { text, model };
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+        if (isTransient(e)) {
+          lastErr = e;
+          await log(`${label}: ${model} non disponibile (${e.status === 429 ? 'quota esaurita' : 'sovraccarico'}), provo il modello successivo`);
+          continue;
+        }
+        if (e instanceof ApiError && e.status === 404 && model !== settings.reviseModel) { unavailable.add(model); continue; }
+        throw e;
+      }
+    }
+    throw new BusyError(lastErr || new ApiError('Nessun modello disponibile.', 503));
+  };
+
   // ---- Autodiagnosi (una volta per esecuzione)
   let diagnosed = false;
   const runDiagnosis = async cause => {
@@ -179,26 +211,48 @@ export async function processJob(id, ctx) {
           const a = await audioFor(i, t);
           progress({ step: 'transcribe', chunk: i, total });
           try {
-            raw = await gemini.transcribe({ model: settings.transcribeModel, audio: a, language: settings.language, vocabulary: t.vocab ? vocabulary : [] });
+            raw = await gemini.transcribe({
+              model: settings.transcribeModel, audio: a, language: settings.language,
+              vocabulary: t.vocab ? vocabulary : [], maxOutputTokens: 32768, overloadRetries: 3,
+            });
             engine = settings.transcribeModel;
           } catch (e) {
-            if (e.name === 'AbortError' || !(e instanceof ApiError) || ![403, 404].includes(e.status)) throw e;
-            await log(`Modello di trascrizione non disponibile (${e.message}); uso ${settings.reviseModel}`);
-            strategy = { ...strategy, transcribe: { ...t, use: false } };
-            saveStrategy(strategy);
+            if (e.name === 'AbortError' || !(e instanceof ApiError)) throw e;
+            if ([403, 404].includes(e.status)) {
+              await log(`Modello di trascrizione non disponibile (${e.message}); uso ${settings.reviseModel}`);
+              strategy = { ...strategy, transcribe: { ...t, use: false } };
+              saveStrategy(strategy);
+            } else if (isTransient(e)) {
+              await log(`${settings.transcribeModel} sovraccarico: trascrivo questo blocco con un modello generale`);
+            } else throw e;
           }
         }
         if (raw === undefined) {
           const r = strategy.revise;
           const a = await audioFor(i, r);
           progress({ step: 'transcribe', chunk: i, total });
-          raw = await gemini.generate({
-            model: settings.reviseModel, audio: a, endpoint: r.endpoint, label: 'Trascrizione',
+          ({ text: raw, model: engine } = await withModels('Trascrizione', model => gemini.generate({
+            model, audio: a, endpoint: r.endpoint, label: 'Trascrizione', config: { maxOutputTokens: 32768, thinkingLevel: 'low' }, overloadRetries: 2,
             prompt: transcriptionPrompt({ course: job.course, glossary: glossaryText, range: chunk.mode === 'range' ? [chunk.start, chunk.end] : null }),
-          });
-          engine = settings.reviseModel;
+          })));
         }
         raw = stripFences(raw);
+        // Risposta interrotta prima della fine dell'audio: si chiede il seguito.
+        for (let k = 0; gemini.last?.truncated && raw && k < 4; k++) {
+          await log(`Blocco ${i + 1}: trascrizione interrotta dopo ${countWords(raw)} parole, chiedo il seguito`);
+          const r = strategy.revise;
+          const a = await audioFor(i, r);
+          const tail = raw.replace(/\s+/g, ' ').slice(-300);
+          const { text: more } = await withModels('Trascrizione', model => gemini.generate({
+            model, audio: a, endpoint: r.endpoint, label: 'Trascrizione', config: { maxOutputTokens: 32768, thinkingLevel: 'low' }, overloadRetries: 2,
+            prompt: continuationPrompt({ course: job.course, glossary: glossaryText, tail }),
+          }));
+          if (!stripFences(more)) break;
+          raw = `${raw}\n\n${stripFences(more)}`;
+        }
+        const minutes = Math.max(0.1, (chunk.end - chunk.start) / 60);
+        const words = countWords(raw);
+        await log(`Blocco ${i + 1}: trascritte ${words} parole in ${fmtTime(chunk.end - chunk.start)} (${Math.round(words / minutes)} al minuto) con ${engine}`);
         if (!raw) await log(`Blocco ${i + 1}: nessun parlato riconosciuto`);
         job = await patch(j => { Object.assign(j.chunks[i], { raw, engine }); });
         chunk = job.chunks[i];
@@ -214,12 +268,19 @@ export async function processJob(id, ctx) {
           start: chunk.start, end: chunk.end, prevTail: i > 0 ? tailOf(job.chunks[i - 1]) : '',
           withAudio: !!a, range: chunk.mode === 'range' ? [chunk.start, chunk.end] : null,
         });
-        const revised = stripFences(await gemini.generate({ model: settings.reviseModel, prompt, audio: a, endpoint: r.endpoint, label: 'Revisione' }));
+        const { text, model } = await withModels('Revisione', m => gemini.generate({
+          model: m, prompt, audio: a, endpoint: r.endpoint, label: 'Revisione', config: REVISE_CONFIG, overloadRetries: 2,
+        }));
+        const revised = stripFences(text);
         if (!revised) throw new ApiError('La revisione è tornata vuota.', 500);
+        const truncated = !!gemini.last?.truncated;
         const paragraphs = paragraphsFromChunk(revised, chunk.start, chunk.end);
         const check = completenessCheck(chunk.raw, revised);
-        if (check.warn) await log(`Blocco ${i + 1}: ${check.warn}`);
-        job = await patch(j => { Object.assign(j.chunks[i], { revised, paragraphs, ratio: check.ratio, warn: check.warn }); });
+        let warn = check.warn;
+        if (truncated) warn = 'La revisione si è interrotta prima della fine del blocco: la parte finale è solo nella versione grezza.';
+        if (warn) await log(`Blocco ${i + 1}: ${warn}`);
+        if (model !== settings.reviseModel) await log(`Blocco ${i + 1}: rivisto con ${model} (il modello scelto era sovraccarico)`);
+        job = await patch(j => { Object.assign(j.chunks[i], { revised, paragraphs, ratio: check.ratio, warn, reviseEngine: model }); });
       } else {
         job = await patch(j => { const c = j.chunks[i]; c.paragraphs = paragraphsFromRaw(c.raw || '', c.start); });
       }

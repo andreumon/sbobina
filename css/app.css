@@ -391,3 +391,42 @@ button.quiet:hover { color: var(--ink); text-decoration-color: var(--accent); }
 .course-lectures li { border-top: 1px solid var(--line); }
 .course-lectures .row-btn { display: block; width: 100%; text-align: left; border: 0; background: none; cursor: pointer; padding: 11px 0; }
 .course-lectures .row-btn:hover .l-title { text-decoration: underline; text-decoration-color: var(--accent); }
+
+/* ---------- Menu della lezione ---------- */
+.lectures li, .course-lectures li { position: relative; }
+.row-btn { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+.row-more {
+  position: absolute; right: 10px; top: 8px; width: 34px; height: 34px; border-radius: 50%;
+  border: 0; background: none; color: var(--muted); cursor: pointer; font: 600 1.1rem/1 var(--sans);
+  opacity: 0; pointer-events: none;
+}
+@media (hover: hover) and (pointer: fine) {
+  li:hover > .row-more, .row-more:focus-visible { opacity: 1; pointer-events: auto; }
+  .row-more:hover { background: var(--accent-soft); color: var(--ink); }
+}
+.sheet-backdrop { position: fixed; inset: 0; z-index: 40; background: rgba(10, 16, 14, 0.38); }
+.sheet {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 41; background: var(--surface);
+  border-radius: 14px 14px 0 0; padding: 8px 0 max(12px, env(safe-area-inset-bottom));
+  box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.18); max-height: 80dvh; overflow-y: auto;
+  animation: sheet-in 0.18s ease-out;
+}
+@keyframes sheet-in { from { transform: translateY(24px); opacity: 0; } }
+.sheet.popover {
+  right: auto; bottom: auto; width: 250px; border-radius: 10px; padding: 6px 0;
+  border: 1px solid var(--line); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.22); animation: none;
+}
+.sheet-title { margin: 6px 20px 8px; font: 600 1rem/1.35 var(--serif); color: var(--ink); overflow-wrap: anywhere; }
+.sheet.popover .sheet-title { margin: 6px 14px 6px; font-size: 0.92rem; color: var(--muted); }
+.sheet-item {
+  display: block; width: 100%; text-align: left; border: 0; background: none; cursor: pointer;
+  padding: 13px 20px; font-size: 1rem; color: var(--ink);
+}
+.sheet.popover .sheet-item { padding: 8px 14px; font-size: 0.93rem; }
+.sheet-item:hover, .sheet-item:focus-visible { background: var(--accent-soft); outline: none; }
+.sheet-item[aria-current="true"] { box-shadow: inset 3px 0 0 var(--accent); font-weight: 500; }
+.sheet-item.danger { color: var(--danger); }
+.sheet-form { padding: 6px 20px 4px; }
+.sheet-form label { display: block; font-size: 0.9rem; font-weight: 500; margin-bottom: 6px; }
+.sheet.popover .sheet-form { padding: 6px 14px; }
+.sheet-backdrop.clear { background: transparent; }

@@ -87,6 +87,7 @@ export function completenessCheck(raw, revised) {
   const ratio = b / a;
   let warn = null;
   if (ratio < 0.85) warn = `La revisione ha il ${Math.round((1 - ratio) * 100)}% di parole in meno della trascrizione grezza: qui il modello potrebbe aver tagliato o riassunto. Confronta con la versione grezza.`;
+  else if (ratio > 1.5) warn = `La trascrizione grezza di questo blocco sembra incompleta: la revisione, che ha riascoltato l'audio, ha ${ratio.toFixed(1).replace('.', ',')} volte le sue parole. I passaggi presenti solo nella versione rivista vanno verificati ascoltando l'audio.`;
   else if (ratio > 1.2) warn = `La revisione ha il ${Math.round((ratio - 1) * 100)}% di parole in più della trascrizione grezza: qui il modello potrebbe aver aggiunto testo. Confronta con la versione grezza.`;
   return { ratio, warn };
 }

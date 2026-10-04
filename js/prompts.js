@@ -53,3 +53,17 @@ export function revisionPrompt({ raw, course, glossary, index, total, start, end
     '', 'TRASCRIZIONE GREZZA:', '<<<', raw, '>>>');
   return lines.join('\n');
 }
+
+/** Prosecuzione di una trascrizione che si è interrotta (risposta troncata). */
+export function continuationPrompt({ course, glossary, tail }) {
+  return [
+    `Questa è la registrazione di una lezione universitaria${course ? ` del corso "${course}"` : ''}, in italiano.`,
+    'Una trascrizione letterale si è interrotta. Le ultime parole trascritte sono:',
+    `«${tail}»`,
+    '',
+    'Continua la trascrizione parola per parola dal punto immediatamente successivo a queste parole, fino alla fine dell\'audio.',
+    'Non ripetere le parole già trascritte, non riassumere, non aggiungere commenti. Punteggiatura essenziale; a capo quando cambia argomento.',
+    glossary ? `Termini tecnici che possono comparire: ${glossary}.` : '',
+    'Rispondi solo con il seguito della trascrizione.',
+  ].filter(Boolean).join('\n');
+}

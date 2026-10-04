@@ -82,6 +82,8 @@ Serve perché il tuo sito possa leggere e scrivere i file di Sbobina nel tuo Dri
   - `←` / `→`: 5 secondi indietro o avanti (con `Maiusc`, 30 secondi).
   - `[` / `]`: velocità.
 - **Sul telefono** il lettore si controlla anche dalla schermata di blocco.
+- **Menu della lezione**: sul telefono tieni premuta una lezione nell'elenco; sul PC tasto destro, oppure il pulsante ⋯ che compare passandoci sopra. Trovi Apri, Rinomina, Sposta, Modifica, Copia, Salva .md, Condividi, Elimina e, se serve, Riprendi.
+- **Google sovraccarico**: se il modello di revisione è sovraccarico, Sbobina passa da solo ai modelli gratuiti di riserva (gemini-3.7-flash, 3.6-flash, 3.5-flash). Se lo sono tutti, mette la lezione *in attesa* e riprova da sola dopo qualche minuto, finché l'app resta aperta.
 - **Correggere**: *Modifica* apre il testo con i tempi. La correzione si sincronizza su tutti i dispositivi, e la versione automatica resta recuperabile.
 - **Corsi**: nell'elenco le lezioni sono raggruppate in cartelle, una per corso. *Nuovo corso* crea un corso con le sue parole chiave. *Parole chiave*, accanto al nome di un corso, apre la sua pagina: lì modifichi nome e parole chiave, aggiungi una registrazione già assegnata al corso o elimini il corso (le lezioni restano, in *Senza corso*). Dalla pagina di una lezione, *Sposta* la assegna a un altro corso; su Drive i file la seguono.
 - **Parole chiave**: aggiungi quelle che il modello sbaglia. Valgono anche per le lezioni del corso non ancora trascritte.
