@@ -1,0 +1,10 @@
+{
+  "name": "sbobina-test",
+  "private": true,
+  "type": "module",
+  "description": "Prova del cambio di chiave API contro un finto server Gemini (nessuna richiesta reale a Google)",
+  "scripts": {
+    "test": "for s in normale principale_esaurita_trascrizione principale_esaurita_tutto principale_limite_minuto principale_offline principale_revocata principale_sovraccarica trascrizione_esaurita_su_entrambe tutto_esaurito telefono_offline solo_principale_esaurita diagnosi_con_principale_revocata; do node run.mjs $s; done"
+  },
+  "devDependencies": { "fake-indexeddb": "^6.0.0" }
+}
