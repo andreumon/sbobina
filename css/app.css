@@ -131,11 +131,32 @@ body[data-screen="pane"] .sidebar { display: none; }
 .add-title { font-weight: 500; }
 .add-hint { color: var(--muted); font-size: 0.86rem; }
 
-.lectures { list-style: none; margin: 0; padding: 0 0 24px; }
-.lectures li + li { border-top: 1px solid var(--line); }
+.list-head { display: flex; align-items: baseline; justify-content: space-between; padding: 14px 20px 4px; }
+.list-head h2 { margin: 0; font: 600 0.95rem/1.3 var(--sans); color: var(--muted); }
+.list-head .quiet { padding: 4px 0; font-size: 0.9rem; }
+.folders { padding-bottom: 24px; }
+.folder { border-top: 1px solid var(--line); }
+.folder:last-child { border-bottom: 1px solid var(--line); }
+.folder-head { display: flex; align-items: center; }
+.folder-toggle {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; text-align: left;
+  border: 0; background: none; cursor: pointer; padding: 13px 8px 13px 14px;
+}
+.folder-toggle svg { width: 18px; height: 18px; color: var(--faint); transition: transform 0.15s; flex: none; }
+.folder[data-open="true"] .folder-toggle svg { transform: rotate(90deg); }
+.folder-name { font: 600 1.02rem/1.3 var(--serif); overflow-wrap: anywhere; }
+.folder-toggle:last-child { padding-right: 20px; }
+.folder-count { color: var(--faint); font-size: 0.85rem; font-variant-numeric: tabular-nums; margin-left: auto; padding-left: 8px; }
+.folder-edit { border: 0; background: none; cursor: pointer; color: var(--muted); font-size: 0.85rem; padding: 13px 20px 13px 8px; white-space: nowrap; }
+.folder-edit:hover { color: var(--ink); text-decoration: underline; text-decoration-color: var(--accent); }
+.folder-head[aria-current="true"] { background: var(--now); box-shadow: inset 3px 0 0 var(--accent); }
+.folder .folder-body { display: none; }
+.folder[data-open="true"] .folder-body { display: block; }
+.folder-empty { color: var(--faint); font-size: 0.88rem; padding: 0 20px 14px 40px; margin: 0; }
+.lectures { list-style: none; margin: 0; padding: 0 0 6px; }
 .lectures .row-btn {
   display: block; width: 100%; text-align: left; border: 0; background: none; cursor: pointer;
-  padding: 13px 20px 13px 20px; border-left: 3px solid transparent;
+  padding: 9px 20px 9px 37px; border-left: 3px solid transparent;
 }
 .lectures .row-btn:hover { background: var(--now); }
 .lectures .row-btn[aria-current="true"] { border-left-color: var(--accent); background: var(--now); }
@@ -357,3 +378,16 @@ button.quiet:hover { color: var(--ink); text-decoration-color: var(--accent); }
 .diag-row { margin-top: 4px; }
 .diag { white-space: pre-wrap; font: 0.8rem/1.5 var(--sans); color: var(--muted); background: var(--surface);
   border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; margin: 8px 0 0; max-height: 320px; overflow: auto; user-select: text; }
+
+.move-row { display: flex; align-items: center; gap: 12px; margin: 10px 0 0; }
+.move-row label { font-size: 0.9rem; color: var(--muted); }
+.move-row select { width: auto; min-width: 200px; }
+.quiet-btn { color: var(--muted); cursor: pointer; text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; padding: 9px 4px; }
+.quiet-btn:hover { color: var(--ink); text-decoration-color: var(--accent); }
+.danger-text:hover { color: var(--danger) !important; text-decoration-color: var(--danger) !important; }
+.course-lectures { max-width: 620px; margin-top: 28px; }
+.course-lectures h3 { font: 600 1.05rem/1.3 var(--serif); margin: 0 0 6px; }
+.course-lectures ol { list-style: none; margin: 0; padding: 0; }
+.course-lectures li { border-top: 1px solid var(--line); }
+.course-lectures .row-btn { display: block; width: 100%; text-align: left; border: 0; background: none; cursor: pointer; padding: 11px 0; }
+.course-lectures .row-btn:hover .l-title { text-decoration: underline; text-decoration-color: var(--accent); }

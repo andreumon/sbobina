@@ -139,18 +139,79 @@ export class Drive {
     return id;
   }
 
-  /** Tutti i file "dati lezione" nella cartella Sbobina. */
+  /**
+   * Tutti i file "dati lezione" creati da Sbobina: nella cartella nascosta dell'app
+   * (versioni nuove) o nella cartella Sbobina (versioni precedenti).
+   */
   async listLectures() {
-    const folder = await this.folderId();
-    const q = encodeURIComponent(`'${folder}' in parents and appProperties has { key='kind' and value='data' } and trashed=false`);
+    await this.folderId();
+    const q = encodeURIComponent("appProperties has { key='kind' and value='data' } and trashed=false");
     const out = [];
-    let pageToken = '';
-    do {
-      const r = await this.json(`${API}/files?q=${q}&pageSize=200&fields=nextPageToken,files(id,name,modifiedTime,appProperties)${pageToken ? `&pageToken=${pageToken}` : ''}`);
-      out.push(...(r.files || []));
-      pageToken = r.nextPageToken || '';
-    } while (pageToken);
+    for (const space of ['appDataFolder', 'drive']) {
+      let pageToken = '';
+      do {
+        const r = await this.json(`${API}/files?q=${q}&spaces=${space}&pageSize=200&fields=nextPageToken,files(id,name,modifiedTime,appProperties)${pageToken ? `&pageToken=${pageToken}` : ''}`);
+        out.push(...(r.files || []));
+        pageToken = r.nextPageToken || '';
+      } while (pageToken);
+    }
     return out;
+  }
+
+  // ---------- Cartelle dei corsi (dentro "Sbobina") ----------
+
+  async findCourseFolder(name) {
+    const root = await this.folderId();
+    const safe = String(name).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const q = encodeURIComponent(`name='${safe}' and '${root}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`);
+    const r = await this.json(`${API}/files?q=${q}&spaces=drive&fields=files(id,name)`);
+    return r.files?.[0]?.id || null;
+  }
+
+  /** Cartella del corso (creata se manca). Senza corso: la cartella Sbobina. */
+  async courseFolder(name) {
+    if (!name) return this.folderId();
+    this.courseCache = this.courseCache || new Map();
+    if (this.courseCache.has(name)) return this.courseCache.get(name);
+    let id = await this.findCourseFolder(name);
+    if (!id) {
+      const f = await this.json(`${API}/files?fields=id`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, mimeType: 'application/vnd.google-apps.folder', parents: [await this.folderId()] }),
+      });
+      id = f.id;
+    }
+    this.courseCache.set(name, id);
+    return id;
+  }
+
+  async renameCourseFolder(oldName, newName) {
+    this.courseCache?.clear();
+    const id = await this.findCourseFolder(oldName);
+    if (!id || await this.findCourseFolder(newName)) return;
+    await this.json(`${API}/files/${id}?fields=id`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: newName }),
+    });
+  }
+
+  /** Cestina la cartella del corso se non contiene più file. */
+  async trashCourseFolderIfEmpty(name) {
+    this.courseCache?.delete(name);
+    const id = await this.findCourseFolder(name);
+    if (!id) return;
+    const q = encodeURIComponent(`'${id}' in parents and trashed=false`);
+    const r = await this.json(`${API}/files?q=${q}&spaces=drive&pageSize=1&fields=files(id)`);
+    if (!r.files?.length) await this.trash(id);
+  }
+
+  /** Sposta un file in un'altra cartella. */
+  async move(fileId, toId) {
+    const f = await this.json(`${API}/files/${fileId}?fields=parents`);
+    const from = (f.parents || []).filter(p => p !== toId).join(',');
+    if ((f.parents || []).includes(toId) && !from) return;
+    await this.json(`${API}/files/${fileId}?addParents=${toId}${from ? `&removeParents=${from}` : ''}&fields=id`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
   }
 
   getJson(id) { return this.json(`${API}/files/${id}?alt=media`); }
@@ -197,8 +258,8 @@ export class Drive {
   }
 
   /** Caricamento a pezzi (ripristinabile) per file grandi come l'audio. */
-  async uploadLarge(blob, { name, mimeType, appProperties }, onProgress = () => {}) {
-    const parent = await this.folderId();
+  async uploadLarge(blob, { name, mimeType, appProperties, parentId }, onProgress = () => {}) {
+    const parent = parentId || await this.folderId();
     const start = await this.req(`${UP}/files?uploadType=resumable&fields=id`, {
       method: 'POST',
       headers: {

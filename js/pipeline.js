@@ -5,7 +5,7 @@
 // Se Google rifiuta la richiesta (errore 400), parte un'autodiagnosi su pochi secondi
 // della lezione (vedi strategy.js) e l'elaborazione riprende con la variante che funziona.
 import * as store from './store.js';
-import { analyzeAdts, planChunks, probeDuration } from './aac.js';
+import { analyzeAdts, planChunks, probeDuration, sliceParts } from './aac.js';
 import { Gemini, ApiError, blobToBase64 } from './gemini.js';
 import { transcriptionPrompt, revisionPrompt } from './prompts.js';
 import { paragraphsFromChunk, paragraphsFromRaw, completenessCheck, glossaryTerms, fmtTime } from './text.js';
@@ -15,6 +15,7 @@ import {
 
 const GEMINI_FILE_TTL = 46 * 3600 * 1000; // Google li tiene 48 ore
 const MAX_REQUEST_SEC = 54 * 60;           // limite del modello di trascrizione: 1 ora
+const PLAN_VERSION = 2;                    // 2: esclude il frame finto iniziale del registratore
 
 function stripFences(t) {
   return String(t || '').replace(/^\s*```[a-z]*\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
@@ -61,9 +62,10 @@ export async function processJob(id, ctx) {
       const maxSec = limit ? Math.max(60, limit - 60) : undefined;
       if (maxSec) chunkSec = Math.min(chunkSec, maxSec);
       chunks = (await planChunks(info, bytes, chunkSec, { maxSec })).map(c => ({
-        mode: 'slice', start: c.start, end: c.end, startByte: c.startByte, endByte: c.endByte,
+        mode: 'slice', start: c.start, end: c.end, startByte: c.startByte, endByte: c.endByte, parts: c.parts,
       }));
       await log(`Audio AAC di ${fmtTime(duration)}: ${chunks.length === 1 ? 'un blocco unico' : `${chunks.length} blocchi tagliati nelle pause`}`);
+      if (info.junk.length) await log(`Esclusi ${info.junk.length === 1 ? 'un frame' : `${info.junk.length} frame`} non audio scritti dal registratore`);
     } else {
       duration = await probeDuration(audio);
       if (!duration || duration <= MAX_REQUEST_SEC) {
@@ -74,11 +76,20 @@ export async function processJob(id, ctx) {
       }
       await log(`Formato non tagliabile: ${chunks.length} ${chunks.length > 1 ? 'tratti' : 'blocco'}`);
     }
-    job = await patch(j => { j.duration = duration; j.chunks = chunks; });
+    job = await patch(j => { j.duration = duration; j.chunks = chunks; j.planVersion = PLAN_VERSION; });
   };
+  // Lezioni tagliate da una versione precedente: se nulla è ancora trascritto, si ripianifica.
+  const stale = job.chunks?.length && (job.planVersion || 1) < PLAN_VERSION && !job.chunks.some(c => typeof c.raw === 'string');
+  if (stale) {
+    await log('Ripianifico i blocchi con la versione aggiornata del taglio');
+    for (const g of [...Object.values(job.grefs || {}), ...job.chunks.flatMap(c => Object.values(c.grefs || {}))]) gemini.deleteFile(g.name);
+    job = await patch(j => { j.chunks = []; delete j.grefs; });
+  }
   if (!job.chunks?.length) await plan();
 
-  const vocabulary = glossaryTerms(job.glossary);
+  // Parole chiave aggiornate del corso (se modificate dopo il caricamento), altrimenti quelle salvate.
+  const courseCfg = (settings.courses || []).find(c => c.name === job.course);
+  const vocabulary = glossaryTerms(courseCfg ? courseCfg.glossary : job.glossary);
   const glossaryText = vocabulary.join(', ');
 
   // ---- Audio da inviare per un blocco, nella forma richiesta dalla strategia
@@ -88,7 +99,7 @@ export async function processJob(id, ctx) {
     const { format, transport } = step;
     let blob, mime;
     if (chunk.mode === 'slice') {
-      blob = audio.slice(chunk.startByte, chunk.endByte, 'audio/aac');
+      blob = sliceParts(audio, chunk.parts || [[chunk.startByte, chunk.endByte]]);
       mime = 'audio/aac';
     } else {
       if (format === 'wav' && chunk.mode === 'range') {

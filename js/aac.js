@@ -26,6 +26,26 @@ function skipId3(b) {
   return 0;
 }
 
+/**
+ * Alcuni registratori Android (tra cui quello Nothing) scrivono come primo "frame" ADTS
+ * la configurazione del codec (AudioSpecificConfig, 2 byte) invece di audio: un frame
+ * finto da 9 byte. ffmpeg lo scarta con un errore, il decoder del browser e quello di
+ * Google si bloccano. Lo riconosciamo e lo escludiamo da tutto ciò che inviamo.
+ */
+function isConfigFrame(b, i, len) {
+  const headerLen = (b[i + 1] & 0x01) ? 7 : 9;
+  const payload = len - headerLen;
+  if (payload < 2 || payload > 5) return false;
+  const p = i + headerLen;
+  const objectType = b[p] >> 3;
+  const sfi = ((b[p] & 0x07) << 1) | (b[p + 1] >> 7);
+  const channels = (b[p + 1] >> 3) & 0x0f;
+  const hProfile = (b[i + 2] >> 6) & 0x03;
+  const hSfi = (b[i + 2] >> 2) & 0x0f;
+  const hChannels = ((b[i + 2] & 0x01) << 2) | (b[i + 3] >> 6);
+  return objectType === hProfile + 1 && sfi === hSfi && channels === hChannels;
+}
+
 // Un'intestazione è "credibile" se dopo di lei ne parte un'altra (o finisce il file).
 function confirmed(b, i) {
   const h = headerAt(b, i);
@@ -56,6 +76,7 @@ export function analyzeAdts(bytes) {
   let samples = 0;
   let i = first;
   let skipped = 0;
+  const junk = []; // [inizio, fine) in byte dei frame finti da escludere
 
   while (i <= b.length - 7) {
     const h = headerAt(b, i);
@@ -66,6 +87,11 @@ export function analyzeAdts(bytes) {
       if (j > b.length - 7) break;
       skipped += j - i;
       i = j;
+      continue;
+    }
+    if (isConfigFrame(b, i, h.len)) {
+      junk.push([i, i + h.len]);
+      i += h.len;
       continue;
     }
     if (n === cap) {
@@ -93,7 +119,38 @@ export function analyzeAdts(bytes) {
     duration: samples / sampleRate,
     dataEnd: offsets[n - 1] + sizes[n - 1],
     skippedBytes: skipped,
+    junk,
   };
+}
+
+/** Intervalli di byte da inviare per [startByte, endByte), esclusi i frame finti. */
+export function byteParts(info, startByte, endByte) {
+  const parts = [];
+  let cur = startByte;
+  for (const [a, z] of info.junk || []) {
+    if (z <= cur || a >= endByte) continue;
+    if (a > cur) parts.push([cur, a]);
+    cur = Math.max(cur, z);
+  }
+  if (cur < endByte) parts.push([cur, endByte]);
+  return parts;
+}
+
+/** Ricompone un blocco di audio a partire dagli intervalli di byte. */
+export function sliceParts(blob, parts, type = 'audio/aac') {
+  return new Blob(parts.map(([a, z]) => blob.slice(a, z)), { type });
+}
+
+/**
+ * Versione "pulita" di un file ADTS per il lettore audio: toglie l'eventuale frame finto
+ * iniziale leggendo solo l'inizio del file. Gli altri formati restano invariati.
+ */
+export async function cleanForPlayback(blob) {
+  const head = new Uint8Array(await blob.slice(0, 65536).arrayBuffer());
+  const start = skipId3(head);
+  const h = confirmed(head, start);
+  if (h && isConfigFrame(head, start, h.len)) return blob.slice(start + h.len, blob.size, blob.type || 'audio/aac');
+  return blob;
 }
 
 /** Indice del frame che contiene l'istante t (secondi). */
@@ -124,7 +181,10 @@ export async function findQuietFrame(info, bytes, a, b, decode = defaultDecode) 
   if (f1 - f0 < 8) return f0;
 
   try {
-    const slice = bytes.slice(byteStart(info, f0), byteEnd(info, f1));
+    const ranges = byteParts(info, byteStart(info, f0), byteEnd(info, f1));
+    const slice = new Uint8Array(ranges.reduce((a, [x, y]) => a + (y - x), 0));
+    let o = 0;
+    for (const [x, y] of ranges) { slice.set(bytes.subarray(x, y), o); o += y - x; }
     const pcm = await decode(slice.buffer);
     if (pcm && pcm.data.length > pcm.sampleRate) {
       const hop = Math.round(pcm.sampleRate * 0.05);
@@ -189,6 +249,7 @@ export async function planChunks(info, bytes, targetSec = 1200, opts = {}) {
       startFrame: s, endFrame: e,
       start: frameTime(info, s), end: frameTime(info, e),
       startByte: byteStart(info, s), endByte: byteEnd(info, e),
+      parts: byteParts(info, byteStart(info, s), byteEnd(info, e)),
     });
   }
   return chunks;

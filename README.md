@@ -11,7 +11,9 @@ Tutto gratuito: usa il piano gratuito della Gemini API e il tuo Google Drive.
 3. Ogni blocco viene trascritto parola per parola da `gemini-3.5-transcribe`, il modello di Google dedicato alla trascrizione. Gli passiamo l'italiano come lingua e i termini tecnici del corso come vocabolario.
 4. `gemini-3.8-flash` **rivede** il testo riascoltando l'audio. Aggiunge punteggiatura e paragrafi e corregge le parole storpiate in base al contesto. Mette `[?]` sulle correzioni incerte e `[incomprensibile]` dove non si capisce. Aggiunge il tempo d'inizio di ogni paragrafo e scrive le formule in LaTeX.
 5. **Controllo di completezza**: Sbobina confronta il numero di parole della revisione con la trascrizione grezza. Se la revisione ne ha molte meno, il modello potrebbe aver riassunto invece di trascrivere, e l'app te lo segnala. La versione grezza resta sempre disponibile nella scheda *Grezza*.
-6. Su Drive, nella cartella **Sbobina**, finiscono l'audio originale, il `.md` e i dati della lezione. Telefono e PC vedono le stesse lezioni.
+6. Su Drive, nella cartella **Sbobina**, c'è una sottocartella per ogni corso con l'audio originale e il `.md` di ogni lezione. I dati interni (testo grezzo, tempi, impostazioni) stanno nella cartella nascosta dell'app. Telefono e PC vedono le stesse lezioni.
+
+**Nota sul registratore Nothing**: i suoi file `.aac` iniziano con un "frame" finto da 9 byte, che contiene la configurazione del codec invece di audio. Google e il browser si bloccano su quel frame. Sbobina lo riconosce e lo esclude prima dell'invio; il file originale su Drive resta intatto.
 
 Se chiudi l'app o cade la rete, l'elaborazione riparte dal blocco in cui si era fermata.
 
@@ -81,7 +83,8 @@ Serve perché il tuo sito possa leggere e scrivere i file di Sbobina nel tuo Dri
   - `[` / `]`: velocità.
 - **Sul telefono** il lettore si controlla anche dalla schermata di blocco.
 - **Correggere**: *Modifica* apre il testo con i tempi. La correzione si sincronizza su tutti i dispositivi, e la versione automatica resta recuperabile.
-- **Glossario**: i termini tecnici sono salvati per corso. Aggiungi quelli che il modello sbaglia e dalla lezione dopo li riconoscerà meglio.
+- **Corsi**: nell'elenco le lezioni sono raggruppate in cartelle, una per corso. *Nuovo corso* crea un corso con le sue parole chiave. *Parole chiave*, accanto al nome di un corso, apre la sua pagina: lì modifichi nome e parole chiave, aggiungi una registrazione già assegnata al corso o elimini il corso (le lezioni restano, in *Senza corso*). Dalla pagina di una lezione, *Sposta* la assegna a un altro corso; su Drive i file la seguono.
+- **Parole chiave**: aggiungi quelle che il modello sbaglia. Valgono anche per le lezioni del corso non ancora trascritte.
 - **Spazio**: una lezione da 90 minuti pesa circa 85 MB. Dalle impostazioni puoi togliere l'audio dal telefono: resta su Drive e torna quando premi play.
 
 ## Limiti da sapere

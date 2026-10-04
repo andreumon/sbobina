@@ -7,7 +7,7 @@ import { Sync } from './sync.js';
 import { Player } from './player.js';
 import { processJob } from './pipeline.js';
 import { Gemini, explainError } from './gemini.js';
-import { guessMime } from './aac.js';
+import { guessMime, cleanForPlayback } from './aac.js';
 import { diagnose, describeStrategy, saveStrategy, resetStrategy, loadStrategy } from './strategy.js';
 import {
   fmtTime, lectureParagraphs, toMarkdown, safeFileName, countUncertain, toEditable, parseEditable,
@@ -41,9 +41,10 @@ const state = {
 
 function show(view) {
   state.view = view;
-  for (const [name, el] of Object.entries({ home: 'vHome', new: 'vNew', lecture: 'vLecture', settings: 'vSettings' })) {
+  for (const [name, el] of Object.entries({ home: 'vHome', new: 'vNew', course: 'vCourse', lecture: 'vLecture', settings: 'vSettings' })) {
     $(el).hidden = name !== view;
   }
+  if (view !== 'course') { state.courseName = null; markCurrentRow(); }
   document.body.dataset.screen = view === 'home' ? 'list' : 'pane';
   if (view !== 'lecture') { state.jobId = null; player.unload(); markCurrentRow(); }
   document.querySelector('.pane').scrollTop = 0;
@@ -61,6 +62,7 @@ document.addEventListener('click', e => {
 window.addEventListener('popstate', e => {
   const v = e.state?.v || 'home';
   if (v === 'lecture' && e.state.id) openLecture(e.state.id, { push: false });
+  else if (v === 'course') openCourse(e.state.name ?? null, { push: false });
   else if (v === 'settings') { renderSettings(); show('settings'); }
   else show('home');
 });
@@ -122,35 +124,185 @@ function lectureMeta(job) {
   return [job.course, date, job.duration ? fmtTime(job.duration) : null].filter(Boolean).join(', ');
 }
 
+function lectureRow(job) {
+  const st = stateLabel(job);
+  const unsure = job.status === 'done' ? countUncertain(lectureParagraphs(job).map(p => p.text).join(' ')) : 0;
+  const extra = st ? `<span class="l-state ${st.cls}">${esc(st.text)}</span>`
+    : unsure ? `${unsure} ${unsure === 1 ? 'punto' : 'punti'} da verificare` : '';
+  const date = new Date(job.recordedAt || job.createdAt).toLocaleDateString('it-IT', { day: 'numeric', month: 'short', year: 'numeric' });
+  const meta = [date, job.duration ? fmtTime(job.duration) : null].filter(Boolean).join(', ');
+  return `<li><button type="button" class="row-btn" data-id="${job.id}"${job.id === state.jobId ? ' aria-current="true"' : ''}>
+    <span class="l-title">${esc(job.title)}</span>
+    <span class="l-meta">${esc(meta)}${extra ? `<br>${extra}` : ''}</span>
+  </button></li>`;
+}
+
+/** Corsi noti: quelli salvati più quelli che compaiono solo nelle lezioni (es. creati su un altro dispositivo). */
+function allCourseNames(jobs) {
+  const names = new Set(settings.courses.map(c => c.name));
+  for (const j of jobs) if (j.course) names.add(j.course);
+  return [...names].sort((a, b) => a.localeCompare(b, 'it'));
+}
+
 async function renderList() {
   const jobs = await store.listJobs();
-  const ol = $('lectureList');
-  ol.innerHTML = jobs.map(job => {
-    const st = stateLabel(job);
-    const unsure = job.status === 'done' ? countUncertain(lectureParagraphs(job).map(p => p.text).join(' ')) : 0;
-    const extra = st ? `<span class="l-state ${st.cls}">${esc(st.text)}</span>`
-      : unsure ? `${unsure} ${unsure === 1 ? 'punto' : 'punti'} da verificare` : '';
-    return `<li><button type="button" class="row-btn" data-id="${job.id}"${job.id === state.jobId ? ' aria-current="true"' : ''}>
-      <span class="l-title">${esc(job.title)}</span>
-      <span class="l-meta">${esc(lectureMeta(job))}${extra ? `<br>${extra}` : ''}</span>
-    </button></li>`;
+  const closed = new Set(store.device.get('closedFolders', []));
+  const groups = allCourseNames(jobs).map(name => ({ name, jobs: jobs.filter(j => j.course === name) }));
+  const loose = jobs.filter(j => !j.course);
+  if (loose.length) groups.push({ name: '', jobs: loose });
+  // La cartella della lezione aperta resta aperta.
+  const current = jobs.find(j => j.id === state.jobId);
+  if (current) closed.delete(current.course || '');
+
+  $('lectureList').innerHTML = groups.map(g => {
+    const isOpen = !closed.has(g.name) || groups.length === 1;
+    const label = g.name || 'Senza corso';
+    return `<section class="folder" data-course="${esc(g.name)}" data-open="${isOpen}">
+      <div class="folder-head"${g.name && g.name === state.courseName ? ' aria-current="true"' : ''}>
+        <button type="button" class="folder-toggle" aria-expanded="${isOpen}">
+          <svg><use href="#i-chev"/></svg>
+          <span class="folder-name">${esc(label)}</span>
+          <span class="folder-count">${g.jobs.length}</span>
+        </button>
+        ${g.name ? `<button type="button" class="folder-edit" aria-label="Parole chiave di ${esc(label)}">Parole chiave</button>` : ''}
+      </div>
+      ${g.jobs.length ? `<ol class="lectures folder-body">${g.jobs.map(lectureRow).join('')}</ol>` : `<p class="folder-empty folder-body">Ancora nessuna lezione.</p>`}
+    </section>`;
   }).join('');
-  $('emptyList').hidden = jobs.length > 0;
+  $('emptyList').hidden = groups.length > 0;
 }
 
 function markCurrentRow() {
   document.querySelectorAll('.row-btn').forEach(b => {
     if (b.dataset.id === state.jobId) b.setAttribute('aria-current', 'true'); else b.removeAttribute('aria-current');
   });
+  document.querySelectorAll('.folder-head').forEach(h => {
+    const name = h.parentElement.dataset.course;
+    if (name && name === state.courseName) h.setAttribute('aria-current', 'true'); else h.removeAttribute('aria-current');
+  });
 }
 
 $('lectureList').addEventListener('click', e => {
-  const b = e.target.closest('.row-btn');
-  if (b) openLecture(b.dataset.id);
+  const row = e.target.closest('.row-btn');
+  if (row) { openLecture(row.dataset.id); return; }
+  const folder = e.target.closest('.folder');
+  if (!folder) return;
+  const name = folder.dataset.course;
+  if (e.target.closest('.folder-edit')) { openCourse(name); return; }
+  if (e.target.closest('.folder-toggle')) {
+    const isOpen = folder.dataset.open !== 'true';
+    folder.dataset.open = String(isOpen);
+    folder.querySelector('.folder-toggle').setAttribute('aria-expanded', String(isOpen));
+    const closed = new Set(store.device.get('closedFolders', []));
+    if (isOpen) closed.delete(name); else closed.add(name);
+    store.device.set('closedFolders', [...closed]);
+  }
 });
+
+$('newCourseBtn').addEventListener('click', () => openCourse(null));
 
 let listTimer;
 const refreshList = () => { clearTimeout(listTimer); listTimer = setTimeout(renderList, 120); };
+
+// ====================================================================
+// Corsi (cartelle)
+// ====================================================================
+
+async function openCourse(name, { push = true } = {}) {
+  const course = name ? settings.courses.find(c => c.name === name) || { name, glossary: '' } : null;
+  state.courseName = name || null;
+  show('course');
+  markCurrentRow();
+  if (push) history.pushState({ v: 'course', name }, '');
+  $('courseHeading').textContent = course ? course.name : 'Nuovo corso';
+  $('courseName').value = course?.name || '';
+  $('courseKeywords').value = course?.glossary || '';
+  $('courseSave').textContent = course ? 'Salva modifiche' : 'Crea corso';
+  $('courseDelete').hidden = !course;
+  $('courseAddRec').hidden = !course;
+  const jobs = course ? (await store.listJobs()).filter(j => j.course === course.name) : [];
+  $('courseLectures').innerHTML = course
+    ? (jobs.length ? `<h3>Lezioni</h3><ol>${jobs.map(lectureRow).join('')}</ol>` : '<p class="help">Ancora nessuna lezione in questo corso.</p>')
+    : '';
+  if (!course) $('courseName').focus();
+}
+
+$('courseLectures').addEventListener('click', e => {
+  const row = e.target.closest('.row-btn');
+  if (row) openLecture(row.dataset.id);
+});
+
+$('courseForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const name = $('courseName').value.trim().replace(/[\\/]+/g, '-');
+  const glossary = $('courseKeywords').value.trim();
+  if (!name) return;
+  const oldName = state.courseName;
+  if (name !== oldName && settings.courses.some(c => c.name === name)) {
+    toast(`Esiste già un corso "${name}".`);
+    return;
+  }
+  const courses = settings.courses.filter(c => c.name !== oldName);
+  courses.push({ name, glossary });
+  courses.sort((a, b) => a.name.localeCompare(b.name, 'it'));
+  settings = store.saveSettings({ courses });
+  if (oldName && oldName !== name) {
+    for (const j of await store.listJobs()) if (j.course === oldName) await store.updateJob(j.id, x => { x.course = name; });
+    const closed = new Set(store.device.get('closedFolders', []));
+    if (closed.delete(oldName)) { closed.add(name); store.device.set('closedFolders', [...closed]); }
+    if (drive.connected) await drive.renameCourseFolder(oldName, name).catch(err => console.warn(err));
+  }
+  toast(oldName ? 'Corso aggiornato' : 'Corso creato');
+  await renderList();
+  sync.run();
+  openCourse(name, { push: false });
+  history.replaceState({ v: 'course', name }, '');
+});
+
+$('courseDelete').addEventListener('click', async () => {
+  const name = state.courseName;
+  if (!name) return;
+  const n = (await store.listJobs()).filter(j => j.course === name).length;
+  const msg = n
+    ? `Eliminare il corso "${name}"? Le sue ${n === 1 ? 'lezione resta' : `${n} lezioni restano`}, in "Senza corso".`
+    : `Eliminare il corso "${name}"?`;
+  if (!confirm(msg)) return;
+  settings = store.saveSettings({ courses: settings.courses.filter(c => c.name !== name) });
+  for (const j of await store.listJobs()) if (j.course === name) await store.updateJob(j.id, x => { x.course = ''; });
+  show('home');
+  history.pushState({ v: 'home' }, '');
+  await renderList();
+  toast('Corso eliminato');
+  if (drive.connected) {
+    await sync.run();
+    drive.trashCourseFolderIfEmpty(name).catch(() => {});
+  }
+});
+
+$('courseFileInput').addEventListener('change', e => {
+  state.pendingCourse = state.courseName;
+  addPending([...e.target.files].map(file => ({ file })));
+  e.target.value = '';
+});
+
+// Spostare una lezione in un altro corso
+function fillMoveSelect(job) {
+  const names = settings.courses.map(c => c.name);
+  if (job.course && !names.includes(job.course)) names.push(job.course);
+  $('moveSel').innerHTML = '<option value="">Senza corso</option>' +
+    names.map(n => `<option${n === job.course ? ' selected' : ''}>${esc(n)}</option>`).join('');
+}
+$('moveSel').addEventListener('change', async () => {
+  const course = $('moveSel').value;
+  await store.updateJob(state.jobId, j => { j.course = course; });
+  $('moveRow').hidden = true;
+  const closed = new Set(store.device.get('closedFolders', []));
+  closed.delete(course);
+  store.device.set('closedFolders', [...closed]);
+  toast(course ? `Spostata in ${course}` : 'Spostata in Senza corso');
+  renderList();
+  sync.run();
+});
 
 // ====================================================================
 // Nuova trascrizione
@@ -200,7 +352,8 @@ function renderNew() {
       </div>
     </div>`).join('');
   const sel = $('newCourse');
-  const last = store.device.get('lastCourse', '');
+  const last = state.pendingCourse ?? store.device.get('lastCourse', '');
+  state.pendingCourse = null;
   sel.innerHTML = '<option value="">Nessun corso</option>' +
     settings.courses.map(c => `<option${c.name === last ? ' selected' : ''}>${esc(c.name)}</option>`).join('') +
     '<option value="__new">Nuovo corso…</option>';
@@ -246,7 +399,7 @@ $('newForm').addEventListener('submit', async e => {
     const glossary = $('newGlossary').value.trim();
     if (course) {
       const courses = settings.courses.filter(c => c.name !== course);
-      courses.push({ name: course, glossary });
+      courses.push({ ...(settings.courses.find(c => c.name === course) || {}), name: course, glossary });
       courses.sort((a, b) => a.name.localeCompare(b.name, 'it'));
       settings = store.saveSettings({ courses });
       store.device.set('lastCourse', course);
@@ -412,7 +565,7 @@ async function openLecture(id, { push = true, replace = false } = {}) {
   const changed = state.jobId !== id;
   show('lecture');
   state.jobId = id;
-  if (changed) { state.tab = 'revised'; state.userTab = false; state.editing = false; }
+  if (changed) { state.tab = 'revised'; state.userTab = false; state.editing = false; $('moveRow').hidden = true; }
   if (push) history[replace ? 'replaceState' : 'pushState']({ v: 'lecture', id }, '');
   markCurrentRow();
   player.prepare({
@@ -425,19 +578,20 @@ async function openLecture(id, { push = true, replace = false } = {}) {
 async function loadAudio(id, onProg) {
   const job = await store.getJob(id);
   if (!job) return null;
+  let blob;
   try {
-    return await sync.audio(job, onProg);
+    blob = await sync.audio(job, onProg);
   } catch (e) {
-    if (e instanceof DriveAuthError && drive.configured) {
-      player.message('');
-      await drive.connect(); // siamo dentro un tocco su play: il popup è consentito
-      return sync.audio(await store.getJob(id), onProg);
-    }
-    throw e;
+    if (!(e instanceof DriveAuthError && drive.configured)) throw e;
+    player.message('');
+    await drive.connect(); // siamo dentro un tocco su play: il popup è consentito
+    blob = await sync.audio(await store.getJob(id), onProg);
   }
+  return blob ? cleanForPlayback(blob) : blob;
 }
 
 async function renderLecture(job) {
+  if (!job && !state.jobId) return;
   job = job || await store.getJob(state.jobId);
   if (!job || job.id !== state.jobId) return;
   $('lecTitle').textContent = job.title;
@@ -466,6 +620,7 @@ async function renderLecture(job) {
 
 function renderStatus(job) {
   const run = async () => {
+    if (!job && !state.jobId) return;
     job = job || await store.getJob(state.jobId);
     if (!job || job.id !== state.jobId) return;
     const box = $('lecStatus');
@@ -687,6 +842,11 @@ $('lecActions').addEventListener('click', async e => {
       } catch (err) { if (err.name !== 'AbortError') toast('Condivisione non riuscita'); }
       break;
     }
+    case 'move':
+      fillMoveSelect(job);
+      $('moveRow').hidden = !$('moveRow').hidden;
+      if (!$('moveRow').hidden) $('moveSel').focus();
+      break;
     case 'edit':
       state.editing = true;
       $('editor').value = toEditable(job);
@@ -860,7 +1020,6 @@ function renderSettings() {
   $('sTheme').value = store.device.get('theme', 'auto');
   $('sClient').value = store.device.get('clientId', '');
   $('sClientField').hidden = !!DRIVE_CLIENT_ID;
-  renderCourses();
   renderDriveState();
   renderFolderState();
   renderStorage();
@@ -935,40 +1094,6 @@ $('sClient').addEventListener('change', () => {
   store.device.set('clientId', $('sClient').value.trim());
   drive.clientId = $('sClient').value.trim();
   renderDriveState(); renderSyncState();
-});
-
-function renderCourses() {
-  $('sCourses').innerHTML = settings.courses.length
-    ? settings.courses.map((c, i) => `
-      <div class="course" data-i="${i}">
-        <div class="row">
-          <input class="c-name" value="${esc(c.name)}" aria-label="Nome del corso">
-          <button type="button" class="quiet c-del">Elimina</button>
-        </div>
-        <textarea class="c-gloss" rows="3" aria-label="Termini tecnici di ${esc(c.name)}" placeholder="Termini tecnici, separati da virgole">${esc(c.glossary || '')}</textarea>
-      </div>`).join('')
-    : '<p class="help">Nessun corso. Si crea anche dalla schermata di una nuova trascrizione.</p>';
-}
-$('sCourses').addEventListener('change', e => {
-  const row = e.target.closest('.course');
-  if (!row) return;
-  const i = Number(row.dataset.i);
-  const courses = settings.courses.map((c, k) => k === i
-    ? { name: row.querySelector('.c-name').value.trim() || c.name, glossary: row.querySelector('.c-gloss').value.trim() } : c);
-  saveSetting({ courses });
-});
-$('sCourses').addEventListener('click', e => {
-  if (!e.target.classList.contains('c-del')) return;
-  const i = Number(e.target.closest('.course').dataset.i);
-  if (!confirm(`Eliminare il corso "${settings.courses[i].name}"? Le lezioni restano.`)) return;
-  saveSetting({ courses: settings.courses.filter((_, k) => k !== i) });
-  renderCourses();
-});
-$('sAddCourse').addEventListener('click', () => {
-  saveSetting({ courses: [...settings.courses, { name: `Corso ${settings.courses.length + 1}`, glossary: '' }] });
-  renderCourses();
-  const inputs = $('sCourses').querySelectorAll('.c-name');
-  inputs[inputs.length - 1]?.select();
 });
 
 function renderDriveState() {

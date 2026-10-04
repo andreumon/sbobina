@@ -102,13 +102,23 @@ export class Sync {
     let job = await store.getJob(id);
     if (!job) return;
     const ids = { ...(job.remote || {}) };
+    // Cartella del corso (sottocartella di "Sbobina"); senza corso, la cartella principale.
+    const parentId = await this.drive.courseFolder(job.course || '');
+    const currentParent = ids.parentId || await this.drive.folderId();
+    if (currentParent !== parentId) {
+      for (const fid of [ids.audioId, ids.mdId]) if (fid) await this.drive.move(fid, parentId).catch(e => { if (e.status !== 404) throw e; });
+    }
+    if (ids.parentId !== parentId) {
+      job = await store.updateJob(id, j => { j.remote = { ...(j.remote || {}), parentId }; });
+      ids.parentId = parentId;
+    }
 
     // 1. Audio originale (solo dal dispositivo che lo ha ricevuto).
     if (!ids.audioId && job.hasLocalAudio) {
       const blob = await store.getAudio(id);
       if (blob) {
         const name = `${safeFileName(job.title)}.${extOf(job.mime)}`;
-        const file = await this.drive.uploadLarge(blob, { name, mimeType: job.mime, appProperties: { kind: 'audio', job: id } },
+        const file = await this.drive.uploadLarge(blob, { name, mimeType: job.mime, parentId, appProperties: { kind: 'audio', job: id } },
           p => store.emit('upload', { id, progress: p }));
         store.emit('upload', { id, progress: 1, done: true });
         job = await store.updateJob(id, j => { j.remote = { ...(j.remote || {}), audioId: file.id, audioName: name }; });
@@ -125,16 +135,16 @@ export class Sync {
     // 2. Testo in Markdown (quando c'è qualcosa da leggere).
     if (job.chunks?.some(c => c.raw)) {
       const md = await this.drive.writeSmall({
-        id: ids.mdId, name: `${safeFileName(job.title)}.md`, mimeType: 'text/markdown',
+        id: ids.mdId, name: `${safeFileName(job.title)}.md`, mimeType: 'text/markdown', parentId,
         content: toMarkdown(job), appProperties: { kind: 'md', job: id },
       });
       if (md.id !== ids.mdId) job = await store.updateJob(id, j => { j.remote = { ...(j.remote || {}), mdId: md.id }; });
     }
 
-    // 3. Dati completi della lezione.
+    // 3. Dati completi della lezione, nella cartella nascosta dell'app (non ingombrano Drive).
     const snapshot = job.rev || 0;
     const res = await this.drive.writeSmall({
-      id: job._sync?.dataId, name: `${safeFileName(job.title)}.sbobina.json`, mimeType: 'application/json',
+      id: job._sync?.dataId, name: `${id}.json`, mimeType: 'application/json', space: 'appDataFolder',
       content: JSON.stringify(shareable(job)), appProperties: { kind: 'data', job: id },
     });
     await store.updateJob(id, j => {

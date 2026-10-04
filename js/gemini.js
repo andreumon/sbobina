@@ -57,6 +57,9 @@ function retryDelayMs(body) {
 /** Messaggio comprensibile per l'utente a partire da un errore dell'API. */
 export function explainError(e) {
   if (e?.name === 'AbortError') return 'Elaborazione interrotta.';
+  if (e?.name === 'EncodingError' || /decode audio data/i.test(e?.message || '')) {
+    return 'Il browser non riesce a decodificare questo audio per convertirlo. Premi Riprendi: la versione aggiornata invia l\'audio originale.';
+  }
   const msg = e?.message || String(e);
   const s = e?.status;
   if (/API key not valid|API_KEY_INVALID/i.test(msg)) return 'La chiave API Gemini non è valida. Controllala nelle impostazioni.';

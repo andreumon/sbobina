@@ -6,7 +6,7 @@
 //   - trasporto: file caricato con la Files API (uri) | audio dentro la richiesta (inline)
 //   - endpoint:  Interactions API | generateContent
 //   - vocabolario personalizzato sì/no (solo per il modello di trascrizione)
-import { analyzeAdts } from './aac.js';
+import { analyzeAdts, byteParts, sliceParts } from './aac.js';
 import { blobToBase64, ApiError } from './gemini.js';
 import { device } from './store.js';
 
@@ -19,9 +19,10 @@ export const DEFAULT_STRATEGY = {
   testedAt: 0,
 };
 
-export const loadStrategy = () => ({ ...DEFAULT_STRATEGY, ...device.get('apiStrategy', {}) });
-export const saveStrategy = s => device.set('apiStrategy', s);
-export const resetStrategy = () => device.set('apiStrategy', {});
+// 'apiStrategy2': le strategie salvate dalla versione precedente erano falsate dal frame finto.
+export const loadStrategy = () => ({ ...DEFAULT_STRATEGY, ...device.get('apiStrategy2', {}) });
+export const saveStrategy = s => device.set('apiStrategy2', s);
+export const resetStrategy = () => device.set('apiStrategy2', {});
 
 /** Secondi massimi per blocco, dati i vincoli della strategia (null = nessun vincolo). */
 export function maxChunkSec(strategy, nativeBytesPerSec) {
@@ -80,7 +81,7 @@ export async function probeSlice(audio) {
   const head = new Uint8Array(await audio.slice(0, 450_000).arrayBuffer());
   const info = analyzeAdts(head);
   if (!info) return null;
-  return audio.slice(info.offsets[0], info.dataEnd, 'audio/aac');
+  return sliceParts(audio, byteParts(info, info.offsets[0], info.dataEnd));
 }
 
 // ---------------------------------------------------------------- Diagnosi
@@ -93,7 +94,13 @@ export async function diagnose(gemini, { audio, settings, vocabulary = [], onSte
   const native = audio ? await probeSlice(audio) : null;
   const formats = [];
   if (native) formats.push({ format: 'native', blob: native, mime: 'audio/aac' });
-  formats.push({ format: 'wav', blob: native ? await toWav16k(native).catch(() => toneWav()) : toneWav(), mime: 'audio/wav' });
+  // La variante WAV si prova solo se questo dispositivo sa davvero convertire l'audio:
+  // un tono di prova direbbe "funziona" anche quando poi la conversione fallisce.
+  let wav = null;
+  if (native) {
+    try { wav = await toWav16k(native); } catch { results.push({ label: 'Conversione in WAV su questo dispositivo', ok: false, error: 'il browser non riesce a decodificare questo audio' }); }
+  } else wav = toneWav();
+  if (wav) formats.push({ format: 'wav', blob: wav, mime: 'audio/wav' });
 
   const uploaded = {};
   const ref = async (f, transport) => {
