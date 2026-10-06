@@ -10,6 +10,8 @@ import { Gemini, ApiError, blobToBase64, isKeyError } from './gemini.js';
 import { transcriptionPrompt, revisionPrompt, continuationPrompt, langOf } from './prompts.js';
 import * as quota from './quota.js';
 import { paragraphsFromChunk, paragraphsFromRaw, completenessCheck, glossaryTerms, fmtTime, countWords, coverageWarnings } from './text.js';
+import { makeLight, canMakeLight } from './light.js';
+import { Groq, GROQ_MODEL, GROQ_MAX_BYTES, rawFromSegments, whisperLanguage, whisperPrompt, recordGroq, explainGroq } from './groq.js';
 import {
   loadStrategy, saveStrategy, diagnose, describeStrategy, maxChunkSec, toWav16k, isRequestShapeError, INLINE_MAX_BYTES,
 } from './strategy.js';
@@ -134,6 +136,29 @@ export async function processJob(id, ctx) {
   const glossaryText = vocabulary.join(', ');
   const lang = langOf(courseCfg?.lang || job.lang || settings.defaultLang || 'it');
 
+  // ---- Audio leggero (Opus mono 16 kHz, circa 8 volte più piccolo dell'AAC del registratore):
+  // serve a Groq (file fino a 25 MB) e, se Google lo accetta, rende più veloci anche gli invii a Gemini.
+  const mb = n => `${(n / 1e6).toFixed(1).replace('.', ',')} MB`;
+  const sourceOf = i => {
+    const c = job.chunks[i];
+    return c.mode === 'slice' ? sliceParts(audio, c.parts || [[c.startByte, c.endByte]]) : audio;
+  };
+  const lightCache = new Map();
+  const lightOk = settings.lightAudio !== false && await canMakeLight();
+  let lightForGemini = lightOk && !store.device.get('lightRejected', false);
+  const lightFor = async i => {
+    if (!lightOk || job.chunks[i].mode === 'range') return null;
+    if (lightCache.has(i)) return lightCache.get(i);
+    const src = sourceOf(i);
+    const t0 = Date.now();
+    const out = await makeLight(src, { signal, onProgress: p => progress({ step: 'convert', chunk: i, total: job.chunks.length, progress: p }) });
+    await log(out
+      ? `Blocco ${i + 1}: audio leggero ${mb(src.size)} → ${mb(out.size)} in ${Math.round((Date.now() - t0) / 1000)} s`
+      : `Blocco ${i + 1}: conversione in audio leggero non riuscita, uso l'audio originale`);
+    lightCache.set(i, out);
+    return out;
+  };
+
   // ---- Audio da inviare per un blocco, nella forma richiesta dalla strategia
   const wavCache = new Map();
   const audioFor = async (i, step, k = keys[0]) => {
@@ -150,10 +175,14 @@ export async function processJob(id, ctx) {
       blob = audio;
       mime = job.mime;
     }
+    let kind = format;
     if (format === 'wav') {
       if (!wavCache.has(i)) wavCache.set(i, await toWav16k(blob));
       blob = wavCache.get(i);
       mime = 'audio/wav';
+    } else if (lightForGemini && chunk.mode !== 'range') {
+      const light = await lightFor(i);
+      if (light) { blob = light; mime = 'audio/ogg'; kind = 'ogg'; }
     }
     if (transport === 'inline') {
       if (blob.size > INLINE_MAX_BYTES) throw new ApiError('Blocco troppo grande per l\'invio diretto: va ripianificato.', 413);
@@ -161,7 +190,7 @@ export async function processJob(id, ctx) {
     }
     // Caricamento con la Files API, riusato finché il file non scade (un file per chiave:
     // un file caricato con una chiave non è visibile dal progetto dell'altra)
-    const key = quota.scoped(format, k.tag);
+    const key = quota.scoped(kind, k.tag);
     const holder = chunk.mode === 'slice' ? chunk : job;
     const cached = holder.grefs?.[key];
     if (cached?.uri && Date.now() - (cached.at || 0) < GEMINI_FILE_TTL) return { uri: cached.uri, mimeType: mime };
@@ -173,6 +202,64 @@ export async function processJob(id, ctx) {
       h.grefs = { ...(h.grefs || {}), [key]: refData };
     });
     return { uri: f.uri, mimeType: mime }; // tipo canonico, non quello restituito dal server
+  };
+
+  /**
+   * Richiesta a Gemini con l'audio leggero: se Google rifiuta la forma della richiesta, si riprova
+   * con l'audio originale; se così funziona, il rifiuto era dell'audio leggero e non lo si usa più per Gemini.
+   */
+  const withLightFallback = async fn => {
+    try {
+      return await fn();
+    } catch (e) {
+      if (!(lightForGemini && isRequestShapeError(e))) throw e;
+      lightForGemini = false;
+      const r = await fn();
+      store.device.set('lightRejected', true);
+      await log('Gemini non accetta l\'audio leggero: d\'ora in poi gli invio l\'audio originale');
+      return r;
+    }
+  };
+
+  // ---- Groq (facoltativo): trascrizione letterale con Whisper large-v3
+  const groq = (settings.groqKey || '').trim() ? new Groq(settings.groqKey, { signal, log }) : null;
+  let groqOff = null; // motivo per cui Groq non si usa più in questa esecuzione
+  const GROQ_TYPES = /ogg|opus|wav|mpeg|mp3|mp4|m4a|webm|flac/;
+  const viaGroq = async (i, secs, info) => {
+    let blob = await lightFor(i);
+    if (!blob) {
+      const src = sourceOf(i);
+      const type = src.type || job.mime || '';
+      if (src.size > GROQ_MAX_BYTES || !GROQ_TYPES.test(type) || job.chunks[i].mode === 'slice') {
+        groqOff = 'per Groq l\'audio va convertito, e questo browser non ci riesce (servono Chrome, Edge o Firefox recenti)';
+        await log(`Groq: ${groqOff}. Trascrivo con Gemini.`);
+        return null;
+      }
+      blob = src;
+    }
+    for (let attempt = 0; ; attempt++) {
+      progress({ step: 'transcribe', ...info, model: 'Whisper (Groq)' });
+      try {
+        const r = await groq.transcribe({ blob, language: whisperLanguage(lang), prompt: whisperPrompt(vocabulary, lang) });
+        recordGroq(secs);
+        const segments = Array.isArray(r.segments) ? r.segments : [{ start: 0, end: secs, text: r.text || '' }];
+        const { raw, dropped } = rawFromSegments(segments);
+        if (dropped) await log(`Blocco ${i + 1}: scartati ${dropped} pezzi che Whisper aveva probabilmente inventato nei silenzi`);
+        return { raw, engine: `${GROQ_MODEL} (Groq)` };
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+        if (e.status === 429 && Number.isFinite(e.retryMs) && e.retryMs <= MAX_INLINE_WAIT && attempt < 2) {
+          await log(`Groq: limite al minuto, riprovo tra ${Math.ceil(e.retryMs / 1000)} s`);
+          await waitFor(e.retryMs + 1000, info);
+          continue;
+        }
+        if ((e.status === 0 || e.status >= 500) && attempt < 1) { await sleep(5000, signal); continue; }
+        // Chiave rifiutata, quota finita o servizio irraggiungibile: per il resto della lezione si usa Gemini.
+        if ([0, 401, 403, 429].includes(e.status)) groqOff = explainGroq(e);
+        await log(`Blocco ${i + 1}: ${explainGroq(e)} Trascrivo con Gemini.`);
+        return null;
+      }
+    }
   };
 
   // ---- Dosatore: sceglie il modello, rispetta le quote, ricorda chi è esaurito o sovraccarico
@@ -341,34 +428,39 @@ export async function processJob(id, ctx) {
           ...chain.map(model => ({ model, kind: 'generate' })),
         ];
         progress({ step: 'transcribe', ...info });
-        let { text: raw, model: engine } = await runStep({
-          label: 'Trascrizione', candidates, tokens: quota.estimateTokens(secs), info,
-          call: async c => {
-            progress({ step: 'transcribe', ...info, model: c.model, reserve: c.key.tag !== '' });
-            if (c.kind === 'transcribe') {
-              const a = await audioFor(i, strategy.transcribe, c.key);
-              return c.key.gemini.transcribe({ model: c.model, audio: a, language: lang.codes, vocabulary: strategy.transcribe.vocab ? vocabulary : [], maxOutputTokens: 32768 });
-            }
-            const a = await audioFor(i, strategy.revise, c.key);
-            return c.key.gemini.generate({ model: c.model, audio: a, endpoint: strategy.revise.endpoint, label: 'Trascrizione', config: GEN_CONFIG,
-              prompt: transcriptionPrompt({ course: job.course, glossary: glossaryText, range, lang }) });
-          },
-        });
-        raw = stripFences(raw);
-        // Risposta interrotta prima della fine dell'audio: si chiede il seguito.
-        for (let k = 0; gemini.last?.truncated && raw && k < 4; k++) {
-          await log(`Blocco ${i + 1}: trascrizione interrotta dopo ${countWords(raw)} parole, chiedo il seguito`);
-          const tail = raw.replace(/\s+/g, ' ').slice(-300);
-          const { text: more } = await runStep({
-            label: 'Trascrizione', candidates: chain.map(model => ({ model, kind: 'generate' })), tokens: quota.estimateTokens(secs), info,
-            call: async c => c.key.gemini.generate({ model: c.model, audio: await audioFor(i, strategy.revise, c.key), endpoint: strategy.revise.endpoint,
-              label: 'Trascrizione', config: GEN_CONFIG, prompt: continuationPrompt({ course: job.course, glossary: glossaryText, tail, lang }) }),
-          });
-          if (!stripFences(more)) break;
-          raw = `${raw}\n\n${stripFences(more)}`;
+        let raw, engine;
+        if (groq && !groqOff && chunk.mode !== 'range') {
+          const r = await viaGroq(i, secs, info);
+          if (r) ({ raw, engine } = r);
+        }
+        if (raw === undefined) {
+          ({ text: raw, model: engine } = await runStep({
+            label: 'Trascrizione', candidates, tokens: quota.estimateTokens(secs), info,
+            call: async c => {
+              progress({ step: 'transcribe', ...info, model: c.model, reserve: c.key.tag !== '' });
+              if (c.kind === 'transcribe') {
+                return withLightFallback(async () => c.key.gemini.transcribe({ model: c.model, audio: await audioFor(i, strategy.transcribe, c.key), language: lang.codes, vocabulary: strategy.transcribe.vocab ? vocabulary : [], maxOutputTokens: 32768 }));
+              }
+              return withLightFallback(async () => c.key.gemini.generate({ model: c.model, audio: await audioFor(i, strategy.revise, c.key), endpoint: strategy.revise.endpoint, label: 'Trascrizione', config: GEN_CONFIG,
+                prompt: transcriptionPrompt({ course: job.course, glossary: glossaryText, range, lang }) }));
+            },
+          }));
+          raw = stripFences(raw);
+          // Risposta interrotta prima della fine dell'audio: si chiede il seguito.
+          for (let k = 0; gemini.last?.truncated && raw && k < 4; k++) {
+            await log(`Blocco ${i + 1}: trascrizione interrotta dopo ${countWords(raw)} parole, chiedo il seguito`);
+            const tail = raw.replace(/\s+/g, ' ').slice(-300);
+            const { text: more } = await runStep({
+              label: 'Trascrizione', candidates: chain.map(model => ({ model, kind: 'generate' })), tokens: quota.estimateTokens(secs), info,
+              call: async c => withLightFallback(async () => c.key.gemini.generate({ model: c.model, audio: await audioFor(i, strategy.revise, c.key), endpoint: strategy.revise.endpoint,
+                label: 'Trascrizione', config: GEN_CONFIG, prompt: continuationPrompt({ course: job.course, glossary: glossaryText, tail, lang }) })),
+            });
+            if (!stripFences(more)) break;
+            raw = `${raw}\n\n${stripFences(more)}`;
+          }
         }
         const words = countWords(raw);
-        await log(`Blocco ${i + 1}: trascritte ${words} parole in ${fmtTime(secs)} (${Math.round(words / Math.max(0.1, secs / 60))} al minuto) con ${engine}${lastKeyTag ? ' (chiave di riserva)' : ''}`);
+        await log(`Blocco ${i + 1}: trascritte ${words} parole in ${fmtTime(secs)} (${Math.round(words / Math.max(0.1, secs / 60))} al minuto) con ${engine}${lastKeyTag && !/Groq/.test(engine) ? ' (chiave di riserva)' : ''}`);
         if (!raw) await log(`Blocco ${i + 1}: nessun parlato riconosciuto`);
         job = await patch(j => { Object.assign(j.chunks[i], { raw, engine }); });
         chunk = job.chunks[i];
@@ -389,8 +481,8 @@ export async function processJob(id, ctx) {
           tokens: quota.estimateTokens(withAudio ? chunk.end - chunk.start : 0, prompt.length), info,
           call: async c => {
             progress({ step: 'revise', ...info, model: c.model, reserve: c.key.tag !== '' });
-            const a = withAudio ? await audioFor(i, strategy.revise, c.key) : null;
-            return c.key.gemini.generate({ model: c.model, prompt, audio: a, endpoint: strategy.revise.endpoint, label: 'Revisione', config: GEN_CONFIG });
+            return withLightFallback(async () => c.key.gemini.generate({ model: c.model, prompt, endpoint: strategy.revise.endpoint, label: 'Revisione', config: GEN_CONFIG,
+              audio: withAudio ? await audioFor(i, strategy.revise, c.key) : null }));
           },
         });
         const revised = stripFences(text);
@@ -424,6 +516,7 @@ export async function processJob(id, ctx) {
       job = await patch(j => { delete j.chunks[i].grefs; delete j.chunks[i].gfile; });
     }
     wavCache.delete(i);
+    lightCache.delete(i);
     ctx.onChunkDone?.(job, i);
   }
 

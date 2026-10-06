@@ -189,6 +189,7 @@
         </div>
 
         <div class="player" id="player">
+          <button type="button" class="uncertain-jump uncertain-float" id="uncertainFloat" hidden></button>
           <div class="timeline">
             <div class="ticks" data-p="ticks"></div>
             <input type="range" min="0" max="1000" step="1" value="0" data-p="seek" aria-label="Posizione nella lezione">
@@ -245,6 +246,20 @@
           </fieldset>
 
           <fieldset>
+            <legend>Groq <small>(facoltativo)</small></legend>
+            <div class="field">
+              <label for="sGroq">Chiave API Groq</label>
+              <div class="row">
+                <input id="sGroq" type="password" placeholder="gsk_…" spellcheck="false">
+                <button type="button" class="quiet" id="sGroqShow">Mostra</button>
+                <button type="button" id="sGroqTest">Verifica</button>
+              </div>
+              <p class="help">Con questa chiave la trascrizione letterale la fa <b>Whisper large-v3</b> su Groq (gratis, fino a circa 8 ore di audio al giorno) e Gemini si occupa solo della revisione, riascoltando l'audio: le quote Gemini bastano per circa il triplo delle lezioni. Si crea gratis, senza carta, su <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a>. Se Groq non risponde o finisce la quota, la trascrizione torna da sola a Gemini.</p>
+              <p class="help result" id="sGroqResult"></p>
+            </div>
+          </fieldset>
+
+          <fieldset>
             <legend>Google Drive</legend>
             <p class="drive-state" id="sDriveState"></p>
             <div class="row" id="sDriveButtons">
@@ -269,6 +284,8 @@
               <label for="sLang">Lingua delle lezioni senza corso</label>
               <select id="sLang"></select>
             </div>
+            <label class="check"><input type="checkbox" id="sLight"> Invii leggeri: prima di inviare un blocco lo converto in Opus mono (circa 8 volte più piccolo, stessa resa per il riconoscimento del parlato)</label>
+            <p class="help" id="sLightNote" hidden></p>
             <label class="check"><input type="checkbox" id="sRevise"> Revisione: punteggiatura, paragrafi, correzioni dal contesto</label>
             <label class="check"><input type="checkbox" id="sRelisten"> Durante la revisione il modello riascolta l'audio (serve per i tempi dei paragrafi)</label>
             <details class="advanced">

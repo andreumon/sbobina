@@ -11,9 +11,12 @@ import { guessMime, cleanForPlayback } from './aac.js';
 import { diagnose, describeStrategy, saveStrategy, resetStrategy, loadStrategy } from './strategy.js';
 import {
   fmtTime, lectureParagraphs, toMarkdown, safeFileName, countUncertain, toEditable, parseEditable, parseTime,
+  marksIn, resolveMark,
 } from './text.js';
 import { LANGS } from './prompts.js';
 import * as quota from './quota.js';
+import { Groq, explainGroq, groqUsage, GROQ_DAILY_SEC } from './groq.js';
+import { canMakeLight } from './light.js';
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -620,6 +623,7 @@ function progressText(job, p) {
       return `${part}rispetto i limiti gratuiti di Google, riprendo tra ${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
     }
     case 'diagnose': return `Google ha rifiutato la richiesta: provo alcune varianti${p.label ? ` (${p.label})` : ''}…`;
+    case 'convert': return `${part}preparo l'audio leggero ${Math.round((p.progress || 0) * 100)}%`;
     case 'upload': return `${part}invio a Gemini ${Math.round((p.progress || 0) * 100)}%`;
     case 'transcribe': return `${part}trascrizione letterale${p.model ? ` con ${p.model}${p.reserve ? ' (chiave di riserva)' : ''}` : ''}…`;
     case 'revise': return `${part}revisione e controllo${p.model ? ` con ${p.model}${p.reserve ? ' (chiave di riserva)' : ''}` : ''}…`;
@@ -631,7 +635,7 @@ function progressText(job, p) {
 function progressFraction(job, p) {
   const n = p.total || job.chunks?.length || 1;
   if (p.step === 'diagnose') return 0.03;
-  const w = { plan: 0, fetch: 0, upload: 0.15 * (p.progress || 0), transcribe: 0.2, revise: 0.6, done: 1 }[p.step] ?? 0;
+  const w = { plan: 0, fetch: 0, convert: 0.1 * (p.progress || 0), upload: 0.1 + 0.05 * (p.progress || 0), transcribe: 0.2, revise: 0.6, done: 1 }[p.step] ?? 0;
   if (p.step === 'done') return 1;
   if (p.step === 'plan' || p.step === 'fetch') return 0.02;
   return Math.min(0.99, ((p.chunk || 0) + w) / n);
@@ -654,7 +658,7 @@ async function openLecture(id, { push = true, replace = false } = {}) {
   const changed = state.jobId !== id;
   show('lecture');
   state.jobId = id;
-  if (changed) { state.tab = 'revised'; state.userTab = false; state.editing = false; $('moveRow').hidden = true; }
+  if (changed) { state.tab = 'revised'; state.userTab = false; state.editing = false; state.qpop = null; state.pedit = null; $('moveRow').hidden = true; }
   if (push) history[replace ? 'replaceState' : 'pushState']({ v: 'lecture', id }, '');
   markCurrentRow();
   player.prepare({
@@ -700,7 +704,7 @@ async function renderLecture(job) {
   });
   const warns = (job.chunks || []).map((c, i) => c.warn ? `<p>Blocco ${i + 1} (${fmtTime(c.start, long)}–${fmtTime(c.end, long)}): ${linkTimes(c.warn)}</p>` : '').join('');
   $('lecChecks').innerHTML = warns;
-  $('lecChecks').hidden = !warns || state.tab !== 'revised' || !!job.edited;
+  $('lecChecks').hidden = !warns || state.tab !== 'revised' || !!(job.edited && !job.edited.partial);
 
   const hasRevised = !!job.edited || (job.chunks || []).some(c => c.revised);
   $('lecTabs').hidden = !hasRevised;
@@ -710,7 +714,8 @@ async function renderLecture(job) {
 
   $('editorWrap').hidden = !state.editing;
   $('transcript').hidden = state.editing;
-  if (!state.editing) renderTranscript(job);
+  if (state.editing) { closePoint(); renderPointsPill(); }
+  else if (!state.pedit) renderTranscript(job); // con un paragrafo in modifica il testo resta com'è
 }
 
 function renderStatus(job) {
@@ -778,29 +783,40 @@ $('statusActions').addEventListener('click', async e => {
 });
 
 document.querySelectorAll('#lecTabs [role="tab"]').forEach(t => t.addEventListener('click', () => {
+  closePoint();
+  closeParaEditor(false);
   state.tab = t.dataset.tab;
   state.userTab = true;
   renderLecture();
 }));
 
 function highlight(text) {
-  let h = esc(text);
-  h = h.replace(/^(Studente|Docente|Studentessa|Professore|Professoressa):/, '<b class="who">$1:</b>');
-  h = h.replace(/\[incomprensibile\]/gi, '<span class="unintelligible">[incomprensibile]</span>');
-  // Evidenzia la parola o la breve espressione che precede [?]
-  h = h.replace(/((?:[^\s<>[\]]+\s){0,1}[^\s<>[\]]+)\s?\[\?\]/g, '<mark class="unsure">$1 [?]</mark>');
-  return h;
+  // Testo con i punti da verificare cliccabili: ognuno ha il suo numero (data-k) nel paragrafo.
+  let out = '', last = 0;
+  marksIn(text).forEach((m, k) => {
+    out += esc(text.slice(last, m.index));
+    const label = m.kind === 'unsure' ? `${esc(m.words)}${m.words ? ' ' : ''}[?]` : '[incomprensibile]';
+    out += `<mark class="${m.kind}" data-k="${k}" role="button" tabindex="0" aria-label="Verifica: ${esc(m.words || 'passaggio incomprensibile')}">${label}</mark>`;
+    last = m.end;
+  });
+  out += esc(text.slice(last));
+  return out.replace(/^(Studente|Docente|Studentessa|Professore|Professoressa):/, '<b class="who">$1:</b>');
 }
 
 function renderTranscript(job) {
   const art = $('transcript');
   const long = (job.duration || 0) >= 3600;
   const paras = lectureParagraphs(job, state.tab);
+  state.paras = paras;
+  // Se si sta scrivendo nel fumetto, cursore e selezione sopravvivono all'aggiornamento
+  const ae = document.activeElement;
+  const qFocus = ae?.id === 'qpopInput' ? [ae.selectionStart, ae.selectionEnd] : null;
   if (!paras.length) {
     art.innerHTML = `<p class="transcript-empty">${job.status === 'done' ? 'Nessun parlato riconosciuto.' : 'Il testo comparirà qui man mano che i blocchi vengono trascritti.'}</p>`;
     state.paraTimes = [];
+    state.points = [];
     player.setMarks([]);
-    $('uncertainBtn').hidden = true;
+    renderPointsPill();
     return;
   }
   let html = '';
@@ -817,37 +833,366 @@ function renderTranscript(job) {
   });
   art.innerHTML = html;
 
-  // Tempi effettivi (i paragrafi senza tempo ereditano il precedente) e punti da verificare.
+  // Tempi effettivi (i paragrafi senza tempo ereditano il precedente) e punti da verificare,
+  // uno per ogni [?] o [incomprensibile], con il momento stimato in cui cade nell'audio.
   let last = 0;
   state.paraTimes = paras.map(p => (last = p.t ?? last));
-  const unsure = [];
-  paras.forEach((p, i) => { if (/\[\?\]|\[incomprensibile\]/i.test(p.text)) unsure.push(i); });
-  state.unsure = unsure;
-  player.setMarks(unsure.map(i => ({ t: state.paraTimes[i], kind: 'uncertain' })));
-  const ub = $('uncertainBtn');
-  ub.hidden = !unsure.length || state.tab !== 'revised';
-  ub.textContent = `${unsure.length} ${unsure.length === 1 ? 'punto' : 'punti'} da verificare`;
-  state.unsureCursor = -1;
+  state.points = [];
+  paras.forEach((p, i) => marksIn(p.text).forEach((m, k) => state.points.push({ i, k, t: pointTime(i, m.index) })));
+  if (state.pointsJob !== job.id) { state.pointsJob = job.id; state.pointCursor = -1; state.pointsSeen = false; }
+  player.setMarks(state.tab === 'revised' ? state.points.map(pt => ({ t: pt.t, kind: 'uncertain' })) : []);
+  renderPointsPill();
+  state.nowIdx = undefined; // testo ridisegnato: l'evidenziazione del paragrafo in ascolto va rimessa
   highlightNow(player.currentTime);
   if (/\$[^$]+\$/.test(art.textContent)) renderMath(art);
+  // Fumetto o editor aperti prima dell'aggiornamento: si rimettono al loro posto.
+  if (state.qpop && state.tab === 'revised') attachQpop(qFocus);
 }
 
-$('uncertainBtn').addEventListener('click', () => {
-  if (!state.unsure?.length) return;
-  state.unsureCursor = (state.unsureCursor + 1) % state.unsure.length;
-  const i = state.unsure[state.unsureCursor];
+/**
+ * Istante stimato di un punto nel paragrafo i (offset = posizione nel testo): i tempi sono per
+ * paragrafo, quindi si interpola tra il suo inizio e quello del successivo, oppure si stima
+ * dalla velocità del parlato (~15 caratteri al secondo) se l'intervallo contiene una pausa.
+ */
+function pointTime(i, offset) {
+  const p = state.paras[i];
+  const t0 = state.paraTimes[i] || 0;
+  let t1 = null;
+  for (let j = i + 1; j < state.paraTimes.length; j++) if (state.paraTimes[j] > t0) { t1 = state.paraTimes[j]; break; }
+  const spoken = Math.max(4, p.text.length / 15);
+  const span = t1 !== null && t1 - t0 <= spoken * 2 + 10 ? t1 - t0 : spoken;
+  return t0 + (offset / Math.max(1, p.text.length)) * span;
+}
+
+// ---- Nuvoletta "punti da verificare": nella barra delle schede e, quando quella esce
+// dallo schermo, una copia identica che resta sopra il lettore.
+function pointsLabel() {
+  const n = state.points?.length || 0;
+  if (!n) return 'Tutto verificato ✓';
+  const cur = state.qpop ? state.points.findIndex(p => p.i === state.qpop.i && p.k === state.qpop.k) : -1;
+  return cur >= 0 ? `${cur + 1} di ${n} da verificare` : `${n} ${n === 1 ? 'punto' : 'punti'} da verificare`;
+}
+
+function renderPointsPill() {
+  const n = state.points?.length || 0;
+  const show = state.tab === 'revised' && !state.editing && (n > 0 || state.justDone);
+  const label = pointsLabel();
+  for (const id of ['uncertainBtn', 'uncertainFloat']) {
+    $(id).textContent = label;
+    $(id).classList.toggle('done', !n);
+  }
+  $('uncertainBtn').hidden = !show;
+  $('uncertainFloat').hidden = !show || state.tabsVisible !== false;
+}
+
+state.tabsVisible = true;
+new IntersectionObserver(entries => {
+  for (const e of entries) state.tabsVisible = e.isIntersecting;
+  renderPointsPill();
+}, { threshold: 0.6 }).observe($('uncertainBtn'));
+
+function stepPoint(dir = 1) {
+  const pts = state.points || [];
+  if (!pts.length) return;
+  let next;
+  if (state.qpop) {
+    const cur = pts.findIndex(p => p.i === state.qpop.i && p.k === state.qpop.k);
+    next = cur < 0 ? 0 : (cur + dir + pts.length) % pts.length;
+  } else next = ((state.pointCursor ?? -1) + dir + pts.length) % pts.length;
+  openPoint(pts[next].i, pts[next].k);
+}
+for (const id of ['uncertainBtn', 'uncertainFloat']) $(id).addEventListener('click', () => stepPoint(1));
+
+// ---- Fumetto su un punto da verificare: riascolto in ripetizione e correzione rapida.
+function openPoint(i, k, { scroll = true, autoplay = true } = {}) {
+  if (state.tab !== 'revised') return;
+  const pts = state.points || [];
+  const idx = pts.findIndex(p => p.i === i && p.k === k);
+  if (idx < 0) return;
+  closeParaEditor(false);
+  state.pointCursor = idx;
+  state.pointsSeen = true;
+  const m = marksIn(state.paras[i].text)[k];
+  const t = pts[idx].t;
+  const a = Math.max(0, t - 3);
+  state.qpop = { i, k, a, b: Math.max(a + 15, t + 6), draft: m.kind === 'unsure' ? m.words : '' };
+  attachQpop();
+  renderPointsPill();
   const el = $('transcript').querySelector(`.para[data-i="${i}"]`);
-  el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  el?.classList.remove('flash'); void el?.offsetWidth; el?.classList.add('flash');
-  $('uncertainBtn').textContent = `${state.unsureCursor + 1} di ${state.unsure.length} da verificare`;
+  if (scroll) el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  player.setLoop(state.qpop.a, state.qpop.b);
+  if (autoplay) player.seek(state.qpop.a, true);
+}
+
+function attachQpop(restoreSel = null) {
+  const q = state.qpop;
+  const para = $('transcript').querySelector(`.para[data-i="${q.i}"]`);
+  const m = para && marksIn(state.paras[q.i]?.text || '')[q.k];
+  if (!m) { closePoint(); return; }
+  const long = (player.duration || 0) >= 3600;
+  const n = state.points.length;
+  const idx = state.points.findIndex(p => p.i === q.i && p.k === q.k);
+  const unsure = m.kind === 'unsure';
+  let box = $('qpop');
+  const sel = restoreSel || (document.activeElement?.id === 'qpopInput' ? [document.activeElement.selectionStart, document.activeElement.selectionEnd] : null);
+  if (!box) { box = document.createElement('div'); box.id = 'qpop'; box.className = 'qpop'; box.setAttribute('role', 'group'); }
+  box.setAttribute('aria-label', `Punto da verificare ${idx + 1} di ${n}`);
+  box.innerHTML = `
+    <div class="qpop-head">
+      <span class="qpop-n">${idx + 1} di ${n}</span>
+      <span class="qpop-loop" title="Tratto in ripetizione">↻ ${fmtTime(q.a, long)}–${fmtTime(q.b, long)}</span>
+      <button type="button" class="qpop-x" data-q="close" aria-label="Chiudi">×</button>
+    </div>
+    <div class="qpop-audio">
+      <button type="button" data-q="earlier" aria-label="Sposta il tratto 5 secondi prima">−5</button>
+      <button type="button" class="qpop-play" data-q="play">${player.playing ? 'Pausa' : '▶ Riascolta'}</button>
+      <button type="button" data-q="later" aria-label="Sposta il tratto 5 secondi dopo">+5</button>
+    </div>
+    <div class="qpop-fix">
+      <input id="qpopInput" type="text" spellcheck="true" autocomplete="off" value="${esc(q.draft)}" placeholder="${unsure ? 'Testo corretto' : 'Cosa si sente?'}" aria-label="Correzione">
+      <button type="button" class="primary" data-q="apply">Correggi</button>
+    </div>
+    <div class="qpop-actions">
+      <button type="button" data-q="ok">${unsure ? '✓ Va bene così' : 'Lascia incomprensibile'}</button>
+      <button type="button" data-q="para">¶ Modifica paragrafo</button>
+    </div>`;
+  para.after(box);
+  para.classList.add('has-qpop');
+  $('transcript').querySelectorAll('mark.active').forEach(x => x.classList.remove('active'));
+  para.querySelector(`mark[data-k="${q.k}"]`)?.classList.add('active');
+  if (sel) { const inp = $('qpopInput'); inp.focus({ preventScroll: true }); inp.setSelectionRange(...sel); }
+}
+
+function closePoint(stopAudio = true) {
+  if (!state.qpop) return;
+  state.qpop = null;
+  $('qpop')?.remove();
+  $('transcript').querySelectorAll('.has-qpop').forEach(x => x.classList.remove('has-qpop'));
+  $('transcript').querySelectorAll('mark.active').forEach(x => x.classList.remove('active'));
+  player.clearLoop();
+  if (stopAudio) player.pause();
+  renderPointsPill();
+}
+
+player.onTime(() => {
+  const b = document.querySelector('#qpop .qpop-play');
+  if (b) { const txt = player.playing ? 'Pausa' : '▶ Riascolta'; if (b.textContent !== txt) b.textContent = txt; }
 });
+
+/** Applica una modifica al paragrafo i (testo nuovo, o più paragrafi se ci sono righe vuote). */
+async function saveParagraph(i, text) {
+  const id = state.jobId;
+  const job = await store.getJob(id);
+  if (!job) return;
+  const base = job.edited?.paragraphs?.map(p => ({ t: p.t, text: p.text })) || lectureParagraphs(job, 'revised').map(p => ({ t: p.t, text: p.text }));
+  if (!base[i]) return;
+  const parts = String(text).replace(/\r/g, '').split(/\n\s*\n/).map(x => x.replace(/\s*\n\s*/g, ' ').trim()).filter(Boolean);
+  base.splice(i, 1, ...parts.map((x, n) => ({ t: n === 0 ? base[i].t : null, text: x })));
+  await store.updateJob(id, j => {
+    // "partial": modifiche a singoli paragrafi, che non nascondono gli avvisi sui blocchi
+    j.edited = { paragraphs: base, at: Date.now(), partial: j.edited ? !!j.edited.partial : true };
+  });
+  const fresh = await store.getJob(id);
+  renderLecture(fresh);
+  sync.run();
+  scheduleFileUpdate(fresh);
+}
+
+async function resolvePoint(replacement) {
+  const q = state.qpop;
+  if (!q) return;
+  const before = state.points.findIndex(p => p.i === q.i && p.k === q.k);
+  const text = resolveMark(state.paras[q.i].text, q.k, replacement);
+  state.qpop = null;
+  $('qpop')?.remove();
+  await saveParagraph(q.i, text);
+  // Si passa da soli al punto successivo (che ora ha preso il posto di quello risolto).
+  const pts = state.points || [];
+  if (pts.length) {
+    const nx = pts[Math.min(before, pts.length - 1)] && before < pts.length ? pts[before] : pts[0];
+    openPoint(nx.i, nx.k);
+  } else {
+    player.clearLoop();
+    player.pause();
+    state.justDone = true;
+    renderPointsPill();
+    toast('Tutti i punti verificati');
+    setTimeout(() => { state.justDone = false; renderPointsPill(); }, 4000);
+  }
+}
+
+$('transcript').addEventListener('click', async e => {
+  const ts = e.target.closest('.ts');
+  if (ts) { player.seek(Number(ts.dataset.t), true); return; }
+  const mark = e.target.closest('mark[data-k]');
+  if (mark && state.tab === 'revised') {
+    const i = Number(mark.closest('.para').dataset.i), k = Number(mark.dataset.k);
+    if (state.qpop?.i === i && state.qpop?.k === k) { closePoint(); return; }
+    openPoint(i, k, { scroll: false });
+    return;
+  }
+  const q = e.target.closest('#qpop [data-q]');
+  if (!q || !state.qpop) return;
+  const st = state.qpop;
+  switch (q.dataset.q) {
+    case 'close': closePoint(); break;
+    case 'play':
+      if (player.playing) player.pause();
+      else { player.setLoop(st.a, st.b); const t = player.currentTime; await player.seek(t >= st.a && t < st.b ? t : st.a, true); }
+      break;
+    case 'earlier': case 'later': {
+      const d = q.dataset.q === 'earlier' ? -5 : 5;
+      st.a = Math.max(0, st.a + d); st.b = Math.max(st.a + 5, st.b + d);
+      player.setLoop(st.a, st.b);
+      await player.seek(st.a, true);
+      attachQpop();
+      break;
+    }
+    case 'apply': await resolvePoint($('qpopInput').value); break;
+    case 'ok': await resolvePoint(null); break;
+    case 'para': openParaEditor(st.i, { keepLoop: true }); break;
+  }
+});
+$('transcript').addEventListener('input', e => { if (e.target.id === 'qpopInput' && state.qpop) state.qpop.draft = e.target.value; });
+$('transcript').addEventListener('keydown', async e => {
+  if (e.target.id === 'qpopInput') {
+    if (e.key === 'Enter') { e.preventDefault(); await resolvePoint(e.target.value); }
+    else if (e.key === 'Escape') { e.preventDefault(); closePoint(); }
+    return;
+  }
+  const mark = e.target.closest?.('mark[data-k]');
+  if (mark && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); mark.click(); }
+});
+
+// ---- Modifica di un solo paragrafo: doppio clic (o doppio tocco) sul paragrafo, oppure dal fumetto.
+$('transcript').addEventListener('dblclick', e => {
+  if (e.target.closest('#qpop, .pedit, .ts, mark')) return;
+  const para = e.target.closest('.para');
+  if (!para || state.tab !== 'revised') return;
+  window.getSelection()?.removeAllRanges();
+  openParaEditor(Number(para.dataset.i));
+});
+
+// Doppio tocco sul telefono (alcuni browser non generano "dblclick" dal tocco).
+let lastTap = null;
+$('transcript').addEventListener('pointerup', e => {
+  if (e.pointerType !== 'touch' || e.target.closest('#qpop, .pedit, .ts, mark')) return;
+  const para = e.target.closest('.para');
+  if (!para || state.tab !== 'revised') { lastTap = null; return; }
+  const now = Date.now();
+  if (lastTap && lastTap.para === para && now - lastTap.at < 350 && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 30) {
+    lastTap = null;
+    window.getSelection()?.removeAllRanges();
+    openParaEditor(Number(para.dataset.i));
+  } else lastTap = { para, at: now, x: e.clientX, y: e.clientY };
+});
+
+async function openParaEditor(i, { keepLoop = false } = {}) {
+  if (state.pedit?.i === i) return;
+  const job = await store.getJob(state.jobId);
+  if (!job || job.status !== 'done') { toast('Potrai modificare il testo quando l\'elaborazione sarà finita.'); return; }
+  const loop = keepLoop && state.qpop ? { a: state.qpop.a, b: state.qpop.b } : null;
+  closePoint(false);
+  if (!keepLoop) player.clearLoop();
+  closeParaEditor(false);
+  const para = $('transcript').querySelector(`.para[data-i="${i}"]`);
+  if (!para) return;
+  const long = (player.duration || 0) >= 3600;
+  const t = state.paraTimes[i] || 0;
+  state.pedit = { i, loop };
+  if (loop) player.setLoop(loop.a, loop.b); // si continua a riascoltare lo stesso tratto
+  const box = document.createElement('div');
+  box.className = 'pedit';
+  box.id = 'pedit';
+  box.innerHTML = `
+    <div class="pedit-head"><span>Paragrafo da ${fmtTime(t, long)}</span>${loop ? `<span class="qpop-loop">↻ ${fmtTime(loop.a, long)}–${fmtTime(loop.b, long)}</span>` : ''}</div>
+    <textarea id="peditText" spellcheck="true" aria-label="Testo del paragrafo"></textarea>
+    <div class="pedit-bar">
+      <div class="qpop-audio">
+        <button type="button" data-pe="back" aria-label="Indietro 5 secondi">−5</button>
+        <button type="button" class="qpop-play" data-pe="play">${player.playing ? 'Pausa' : '▶ Ascolta'}</button>
+        <button type="button" data-pe="fwd" aria-label="Avanti 5 secondi">+5</button>
+      </div>
+      <div class="pedit-save">
+        <button type="button" class="quiet" data-pe="cancel">Annulla</button>
+        <button type="button" class="primary" data-pe="save">Salva</button>
+      </div>
+    </div>
+    <p class="help">Una riga vuota divide il paragrafo in due. Su PC: Ctrl+Invio salva, Esc annulla.</p>`;
+  para.hidden = true;
+  para.after(box);
+  const ta = $('peditText');
+  ta.value = state.paras[i].text;
+  const fit = () => { ta.style.height = 'auto'; ta.style.height = `${ta.scrollHeight + 4}px`; };
+  ta.addEventListener('input', fit);
+  fit();
+  ta.focus({ preventScroll: true });
+  box.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  renderPointsPill();
+}
+
+function closeParaEditor(rerender = true) {
+  if (!state.pedit) return;
+  const { i } = state.pedit;
+  state.pedit = null;
+  $('pedit')?.remove();
+  const para = $('transcript').querySelector(`.para[data-i="${i}"]`);
+  if (para) para.hidden = false;
+  player.clearLoop();
+  if (rerender) renderLecture();
+}
+
+player.onTime(() => {
+  const b = document.querySelector('#pedit .qpop-play');
+  if (b) { const txt = player.playing ? 'Pausa' : '▶ Ascolta'; if (b.textContent !== txt) b.textContent = txt; }
+});
+
+$('transcript').addEventListener('click', async e => {
+  const b = e.target.closest('#pedit [data-pe]');
+  if (!b || !state.pedit) return;
+  const { i, loop } = state.pedit;
+  switch (b.dataset.pe) {
+    case 'cancel': closeParaEditor(); break;
+    case 'save': {
+      const text = $('peditText').value;
+      state.pedit = null;
+      if (loop) { player.clearLoop(); player.pause(); }
+      await saveParagraph(i, text);
+      toast(text.trim() ? 'Paragrafo salvato' : 'Paragrafo eliminato');
+      break;
+    }
+    case 'play':
+      if (player.playing) player.pause();
+      else if (loop) { player.setLoop(loop.a, loop.b); await player.seek(loop.a, true); }
+      else { const t = player.currentTime, t0 = state.paraTimes[i] || 0; await player.seek(t >= t0 && t < t0 + 600 && player.ready ? t : t0, true); }
+      break;
+    case 'back': player.skip(-5); break;
+    case 'fwd': player.skip(5); break;
+  }
+});
+$('transcript').addEventListener('keydown', e => {
+  if (e.target.id !== 'peditText') return;
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); document.querySelector('#pedit [data-pe="save"]').click(); }
+  else if (e.key === 'Escape') { e.preventDefault(); closeParaEditor(); }
+});
+
+// Dopo una correzione il .md nella cartella del PC si aggiorna da solo (se c'è già o se il
+// salvataggio automatico è attivo); quello su Drive lo aggiorna la sincronizzazione.
+let fileTimer;
+function scheduleFileUpdate(job) {
+  clearTimeout(fileTimer);
+  fileTimer = setTimeout(async () => {
+    try {
+      const handle = await folderFor(job);
+      if (!handle || (await handle.queryPermission({ mode: 'readwrite' })) !== 'granted') return;
+      const name = `${safeFileName(job.title)}.md`;
+      const exists = await handle.getFileHandle(name).then(() => true, () => false);
+      if (exists || store.device.get('folderAuto', false)) await writeToFolder(await store.getJob(job.id), handle, false);
+    } catch (err) { console.warn(err); }
+  }, 2500);
+}
 
 $('lecChecks').addEventListener('click', e => {
-  const ts = e.target.closest('.ts');
-  if (ts) player.seek(Number(ts.dataset.t), true);
-});
-
-$('transcript').addEventListener('click', e => {
   const ts = e.target.closest('.ts');
   if (ts) player.seek(Number(ts.dataset.t), true);
 });
@@ -984,6 +1329,7 @@ async function lectureAction(act, id, from = 'menu') {
       break;
     case 'edit':
       if (state.jobId !== id || state.view !== 'lecture') await openLecture(id);
+      closeParaEditor(false);
       state.editing = true;
       $('editor').value = toEditable(await store.getJob(id));
       $('resetEdit').hidden = !job.edited;
@@ -1144,7 +1490,7 @@ function download(name, text) {
 
 $('saveEdit').addEventListener('click', async () => {
   const paragraphs = parseEditable($('editor').value);
-  await store.updateJob(state.jobId, j => { j.edited = { paragraphs, at: Date.now() }; });
+  await store.updateJob(state.jobId, j => { j.edited = { paragraphs, at: Date.now(), partial: false }; });
   state.editing = false;
   renderLecture();
   sync.run();
@@ -1168,6 +1514,8 @@ document.addEventListener('keydown', e => {
   else if (e.key === 'ArrowRight' || e.key === 'l') { e.preventDefault(); player.skip(e.shiftKey ? 30 : 5); }
   else if (e.key === ']') player.cycleRate(1);
   else if (e.key === '[') player.cycleRate(-1);
+  else if (e.key === 'n' || e.key === 'N') { e.preventDefault(); stepPoint(e.shiftKey ? -1 : 1); }
+  else if (e.key === 'Escape' && state.qpop) closePoint();
 });
 
 // ====================================================================
@@ -1243,7 +1591,7 @@ async function connectAndSync() {
 store.on('sync', () => { renderSyncState(); if (state.view === 'settings') renderDriveState(); });
 store.on('job', job => {
   refreshList();
-  if (job.id === state.jobId && !state.editing && state.view === 'lecture') {
+  if (job.id === state.jobId && !state.editing && !state.pedit && state.view === 'lecture') {
     clearTimeout(renderLecture.t);
     renderLecture.t = setTimeout(() => renderLecture(), 150);
   }
@@ -1308,6 +1656,14 @@ function renderSettings() {
   $('sKey2Result').textContent = '';
   $('sChunk').value = settings.chunkMin;
   $('sChunkOut').textContent = settings.chunkMin;
+  $('sGroq').value = settings.groqKey || '';
+  $('sGroqResult').textContent = '';
+  $('sLight').checked = settings.lightAudio !== false;
+  canMakeLight().then(ok => {
+    $('sLight').disabled = !ok;
+    $('sLightNote').hidden = ok;
+    $('sLightNote').textContent = 'Questo browser non sa convertire l\'audio: si invia l\'originale (e Groq non si può usare). Funziona con Chrome, Edge e Firefox recenti.';
+  });
   $('sRevise').checked = settings.revise;
   $('sRelisten').checked = settings.relisten;
   $('sRelisten').disabled = !settings.revise;
@@ -1409,6 +1765,32 @@ $('sDiagReset').addEventListener('click', () => {
 
 $('sChunk').addEventListener('input', () => { $('sChunkOut').textContent = $('sChunk').value; });
 $('sChunk').addEventListener('change', () => saveSetting({ chunkMin: Number($('sChunk').value) }));
+$('sLight').addEventListener('change', () => {
+  saveSetting({ lightAudio: $('sLight').checked });
+  if ($('sLight').checked) store.device.set('lightRejected', false); // riattivandolo si riprova anche con Gemini
+});
+$('sGroq').addEventListener('change', () => saveSetting({ groqKey: $('sGroq').value.trim() }));
+$('sGroqShow').addEventListener('click', () => {
+  const k = $('sGroq');
+  k.type = k.type === 'password' ? 'text' : 'password';
+  $('sGroqShow').textContent = k.type === 'password' ? 'Mostra' : 'Nascondi';
+});
+$('sGroqTest').addEventListener('click', async () => {
+  const key = $('sGroq').value.trim();
+  saveSetting({ groqKey: key });
+  const out = $('sGroqResult');
+  out.className = 'help result';
+  if (!key) { out.textContent = 'Inserisci prima la chiave.'; return; }
+  out.textContent = 'Verifico…';
+  try {
+    const has = await new Groq(key).check();
+    out.classList.add(has ? 'ok' : 'bad');
+    out.textContent = has ? 'Chiave valida, Whisper large-v3 disponibile.' : 'Chiave valida, ma whisper-large-v3 non risulta tra i modelli disponibili.';
+  } catch (e) {
+    out.classList.add('bad');
+    out.textContent = explainGroq(e);
+  }
+});
 $('sRevise').addEventListener('change', () => { saveSetting({ revise: $('sRevise').checked }); $('sRelisten').disabled = !$('sRevise').checked; });
 $('sRelisten').addEventListener('change', () => saveSetting({ relisten: $('sRelisten').checked }));
 $('sTModel').addEventListener('change', () => saveSetting({ transcribeModel: $('sTModel').value.trim() }));
@@ -1423,6 +1805,10 @@ function renderQuota() {
     const name = quota.keyTagOf(r.model) ? `${quota.baseModel(r.model)} (riserva)` : r.model;
     return `<p><span>${esc(name)}</span><span>${r.used}${r.rpd ? ` / ${r.rpd}` : ''} richieste${state ? `, ${state}` : ''}</span></p>`;
   }).join('') || '<p>Nessuna richiesta oggi.</p>';
+  if (settings.groqKey) {
+    const g = groqUsage();
+    $('sQuota').insertAdjacentHTML('beforeend', `<p><span>Whisper su Groq</span><span>${Math.round(g.sec / 60)} / ${Math.round(GROQ_DAILY_SEC / 60)} minuti di audio</span></p>`);
+  }
 }
 $('sTheme').addEventListener('change', () => { store.device.set('theme', $('sTheme').value); applyTheme(); });
 $('sClient').addEventListener('change', () => {

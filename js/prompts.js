@@ -55,10 +55,13 @@ export function revisionPrompt({ raw, course, glossary, index, total, start, end
     '7. Se interviene uno studente, inizia quel paragrafo con "Studente:" e il paragrafo della risposta con "Docente:". Se un\'altra persona viene presentata per nome e parla, usa il suo nome.',
     '8. Formule e simboli matematici dettati a voce vanno in LaTeX: dentro la frase tra singoli dollari, per esempio $\\hat{\\beta}$; le formule lunghe su una riga a sé tra doppi dollari, per esempio $$\\hat{\\beta} = (X^T X)^{-1} X^T y$$.',
   ];
-  if (withAudio) {
+  // Grezzo di Whisper: ha già tempi precisi all'inizio dei pezzi (relativi al segmento).
+  const timedRaw = !range && /^\s*\[\d{1,3}:\d{2}\]/m.test(raw || '');
+  if (withAudio || timedRaw) {
     lines.push(range
       ? `9. Inizia OGNI paragrafo con il tempo in cui comincia, tra parentesi quadre in formato [MM:SS], misurato dall'inizio della registrazione completa (quindi tra ${fmtMMSS(range[0])} e ${fmtMMSS(range[1])}). I tempi devono essere crescenti.`
       : `9. Inizia OGNI paragrafo con il tempo in cui comincia nell'audio di questo segmento, tra parentesi quadre in formato [MM:SS], misurato dall'inizio del segmento (quindi tra [00:00] e [${lenLabel}]; oltre l'ora i minuti continuano: [61:30]). I tempi devono essere crescenti.`);
+    if (timedRaw) lines.push('   La trascrizione grezza ha già, all\'inizio di ogni pezzo, il tempo [MM:SS] misurato con precisione dall\'inizio del segmento: usalo come riferimento. Un tuo paragrafo inizia al tempo del pezzo grezzo in cui comincia (o poco dopo, se comincia a metà pezzo). Non copiare i tempi grezzi dentro il testo.');
   }
   if (glossary) lines.push('', `Termini tecnici del corso che possono comparire: ${glossary}.`);
   if (prevTail) {

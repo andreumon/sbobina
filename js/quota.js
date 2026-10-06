@@ -164,7 +164,10 @@ export function onError(model, err) {
     if (daily) {
       e.exhausted = true;
       // Google dice tra quanto riprovare: se è prima della mezzanotte del Pacifico, si usa quello.
-      if (Number.isFinite(retryMs) && now() + retryMs < quotaDay().resetAt) e.exhaustedUntil = now() + retryMs + 30_000;
+      // Ma un'attesa breve su una quota GIORNALIERA è il suggerimento generico di Google (spesso
+      // "retry in 40s" anche quando la quota del giorno è finita): seguirlo farebbe ritentare
+      // ogni minuto fino alle 9:00 invece di mettere la lezione in attesa. Si usa solo se lungo.
+      if (Number.isFinite(retryMs) && retryMs >= 15 * 60_000 && now() + retryMs < quotaDay().resetAt) e.exhaustedUntil = now() + retryMs + 30_000;
       else delete e.exhaustedUntil;
       out = { kind: 'daily' };
     } else {

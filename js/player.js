@@ -74,6 +74,7 @@ export class Player {
 
   unload() {
     this.audio.pause();
+    this.clearLoop();
     if (this.url) URL.revokeObjectURL(this.url);
     this.url = null;
     this.audio.removeAttribute('src');
@@ -127,6 +128,8 @@ export class Player {
 
   async seek(t, autoplay = true) {
     if (!(await this.ensureLoaded())) return;
+    // Un salto fuori dal tratto in ripetizione lo annulla (es. barra trascinata altrove)
+    if (this.loop && (t < this.loop.a - 0.5 || t > this.loop.b + 0.5)) this.clearLoop();
     this.audio.currentTime = Math.max(0, Math.min(this.duration || this.audio.duration || 0, t));
     this.tick();
     if (autoplay && this.audio.paused) await this.play();
@@ -157,12 +160,44 @@ export class Player {
     this.renderMarks();
   }
 
+  /**
+   * Ripete il tratto [a, b] finché non si chiama clearLoop (riascolto di un punto da verificare).
+   * onChange(loop|null) avvisa chi mostra il tratto.
+   */
+  setLoop(a, b) {
+    const d = this.duration || Infinity;
+    a = Math.max(0, Math.min(a, d)); b = Math.max(a + 1, Math.min(b, d));
+    this.loop = { a, b };
+    this.renderMarks();
+    this.loopListeners?.forEach(fn => fn(this.loop));
+  }
+
+  clearLoop() {
+    if (!this.loop) return;
+    this.loop = null;
+    this.renderMarks();
+    this.loopListeners?.forEach(fn => fn(null));
+  }
+
+  onLoop(fn) { (this.loopListeners ||= new Set()).add(fn); }
+
+  get playing() { return this.ready && !this.audio.paused && !this.audio.ended; }
+
+  pause() { this.audio.pause(); }
+
   /** marks: [{t, kind:'uncertain'}] mostrati come tacche sulla barra. */
   setMarks(marks) { this.marks = marks || []; this.renderMarks(); }
 
   renderMarks() {
     this.ticksEl.innerHTML = '';
     if (!this.duration) return;
+    if (this.loop) {
+      const r = document.createElement('span');
+      r.className = 'loop-range';
+      r.style.left = `${(this.loop.a / this.duration) * 100}%`;
+      r.style.width = `${((this.loop.b - this.loop.a) / this.duration) * 100}%`;
+      this.ticksEl.appendChild(r);
+    }
     for (const m of this.marks || []) {
       const s = document.createElement('span');
       s.className = `tick ${m.kind || ''}`;
@@ -174,7 +209,11 @@ export class Player {
   get currentTime() { return this.ready ? this.audio.currentTime : 0; }
 
   tick() {
-    const t = this.currentTime;
+    let t = this.currentTime;
+    if (this.loop && this.playing && t >= this.loop.b) {
+      this.audio.currentTime = this.loop.a;
+      t = this.loop.a;
+    }
     if (!this.dragging) {
       this.seekEl.value = this.duration ? Math.round((t / this.duration) * 1000) : 0;
       this.curEl.textContent = fmtTime(t, this.duration >= 3600);

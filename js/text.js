@@ -59,10 +59,18 @@ export function paragraphsFromChunk(text, chunkStart, chunkEnd) {
   return out;
 }
 
-/** Testo grezzo → paragrafi (senza timestamp tranne l'inizio del blocco). */
+/**
+ * Testo grezzo → paragrafi. Il grezzo di Gemini non ha tempi (solo l'inizio del blocco);
+ * quello di Whisper ha [MM:SS] dall'inizio del blocco davanti a ogni paragrafo.
+ */
 export function paragraphsFromRaw(text, chunkStart) {
   const paras = String(text || '').replace(/\r/g, '').split(/\n\s*\n|\n/).map(p => p.trim()).filter(Boolean);
-  return paras.map((p, i) => ({ t: i === 0 ? chunkStart : null, text: p }));
+  return paras.map((p, i) => {
+    const m = p.match(TS_RE);
+    const rel = m ? parseTime(m[1]) : null;
+    const body = m ? p.slice(m[0].length).trim() : p;
+    return { t: rel !== null ? chunkStart + rel : i === 0 ? chunkStart : null, text: body };
+  }).filter(p => p.text);
 }
 
 const FILLERS = new Set(['ehm', 'eh', 'ehh', 'uhm', 'um', 'mh', 'mmh', 'mm', 'mmm', 'ah', 'uh']);
@@ -93,6 +101,41 @@ export function completenessCheck(raw, revised) {
 }
 
 export const countUncertain = text => (String(text || '').match(/\[\?\]|\[incomprensibile\]/gi) || []).length;
+
+// Punti da verificare dentro un paragrafo: "parola [?]" (con la parola, o le due parole, che precedono)
+// oppure "[incomprensibile]". Stesso ordine e stesso conteggio di countUncertain.
+const MARK_RE = /((?:[^\s[\]]+\s)?[^\s[\]]+)\s?\[\?\]|\[\?\]|\[incomprensibile\]/gi;
+
+/** Punti da verificare di un testo: [{index, length, end, kind: 'unsure'|'unintelligible', words}] */
+export function marksIn(text) {
+  return [...String(text || '').matchAll(MARK_RE)].map(m => {
+    // Punteggiatura attaccata al segno precedente ("…[?]. Poi [?]"): non fa parte delle parole
+    const lead = (m[1] || '').match(/^[.,;:!?)\]»"]+\s*/)?.[0].length || 0;
+    const index = m.index + lead;
+    return {
+      index, length: m[0].length - lead, end: m.index + m[0].length,
+      kind: /^\[incomprensibile\]$/i.test(m[0]) ? 'unintelligible' : 'unsure',
+      words: (m[1] || '').slice(lead),
+    };
+  });
+}
+
+/**
+ * Risolve il k-esimo punto da verificare di un testo.
+ * replacement null = "va bene così" (per [?] restano le parole senza il segno; per
+ * [incomprensibile] resta "(incomprensibile)", che non conta più come punto aperto);
+ * una stringa = sostituisce parole e segno (stringa vuota = elimina).
+ */
+export function resolveMark(text, k, replacement = null) {
+  const m = marksIn(text)[k];
+  if (!m) return text;
+  let rep = replacement;
+  if (rep === null) rep = m.kind === 'unsure' ? m.words : '(incomprensibile)';
+  rep = String(rep).trim();
+  const before = text.slice(0, m.index), after = text.slice(m.end);
+  let out = rep ? before + rep + after : before.replace(/\s+$/, '') + (/^[\s.,;:!?)]/.test(after) || !before ? '' : ' ') + after.replace(/^\s+(?=[.,;:!?)])/, '');
+  return out.replace(/ {2,}/g, ' ').replace(/^\s+/, '');
+}
 
 /** Tutti i paragrafi della lezione, rivisti dove disponibili. */
 export function lectureParagraphs(job, which = 'revised') {

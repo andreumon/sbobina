@@ -9,6 +9,8 @@ export const DEFAULTS = {
   chunkMin: 45,
   revise: true,
   relisten: true,
+  groqKey: '',            // facoltativa: con questa la trascrizione letterale la fa Whisper su Groq
+  lightAudio: true,       // converte l'audio in Opus mono 16 kHz prima di inviarlo (circa 8 volte più leggero)
   courses: [],
   updatedAt: 0,
   // Per sincronizzare senza perdere modifiche: quando è stato cambiato ogni campo,
