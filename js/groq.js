@@ -110,11 +110,11 @@ const PHANTOM = /^(?:sottotitoli (?:creati|a cura|e revisione)|.*amara\.org|graz
 /**
  * Segmenti Whisper → testo grezzo a paragrafi, ognuno con il tempo [MM:SS] dall'inizio del blocco.
  * Scarta i segmenti quasi certamente inventati (silenzio + bassa confidenza, ripetizioni, frasi da sottotitoli).
- * @returns {{raw: string, dropped: number}}
+ * @returns {{raw: string, dropped: number, droppedItems: {start:number,text:string,why:string}[]}}
  */
 export function rawFromSegments(segments) {
   const kept = [];
-  let dropped = 0;
+  const droppedItems = [];
   let prev = '';
   let repeats = 0;
   for (const s of segments || []) {
@@ -125,7 +125,10 @@ export function rawFromSegments(segments) {
     const phantom = PHANTOM.test(text) && ((s.no_speech_prob ?? 0) > 0.2 || text.length < 60);
     repeats = text.toLowerCase() === prev ? repeats + 1 : 0;
     prev = text.toLowerCase();
-    if (silent || looping || phantom || repeats >= 2) { dropped++; continue; }
+    if (silent || looping || phantom || repeats >= 2) {
+      droppedItems.push({ start: Number(s.start) || 0, text, why: phantom ? 'frase tipica dei sottotitoli' : looping ? 'ripetizione in loop' : repeats >= 2 ? 'ripetuta' : 'silenzio' });
+      continue;
+    }
     kept.push({ start: Number(s.start) || 0, end: Number(s.end) || 0, text });
   }
   // Paragrafi: si va a capo dopo una pausa lunga, dopo una pausa breve se il paragrafo è già
@@ -142,7 +145,7 @@ export function rawFromSegments(segments) {
       cur.end = s.end;
     }
   }
-  return { raw: paras.map(p => `[${fmtMMSS(p.start)}] ${p.text}`).join('\n\n'), dropped };
+  return { raw: paras.map(p => `[${fmtMMSS(p.start)}] ${p.text}`).join('\n\n'), dropped: droppedItems.length, droppedItems };
 }
 
 /** Lingua per Whisper: solo se la lezione è in una lingua sola (con due lingue meglio il riconoscimento automatico). */

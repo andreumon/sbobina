@@ -8,6 +8,12 @@ const sleep = (ms, signal) => new Promise((resolve, reject) => {
   signal?.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('Interrotto', 'AbortError')); }, { once: true });
 });
 
+/** 75000 → "1 min 15 s" */
+export const fmtDur = ms => {
+  const s = Math.round(ms / 1000);
+  return s >= 60 ? `${Math.floor(s / 60)} min${s % 60 ? ` ${s % 60} s` : ''}` : `${s} s`;
+};
+
 export class ApiError extends Error {
   constructor(message, status, body) {
     super(message);
@@ -87,6 +93,7 @@ export class Gemini {
     const url = path.startsWith('http') ? path : GEMINI_BASE + path;
     for (let attempt = 0; ; attempt++) {
       let res;
+      const t0 = Date.now();
       try {
         res = await fetch(url, { ...init, signal: this.signal, headers: { 'x-goog-api-key': this.key, ...(init.headers || {}) } });
       } catch (err) {
@@ -105,11 +112,15 @@ export class Gemini {
       // 429 (quota) e 503 (sovraccarico) li gestisce il dosatore delle quote: qui al massimo
       // un tentativo rapido per il 503, nessuno per il 429.
       const limit = res.status === 429 ? 0 : res.status === 503 ? Math.min(retries, overloadRetries) : retries;
+      const took = Date.now() - t0;
+      const after = took >= 5000 ? ` dopo ${fmtDur(took)} di attesa della risposta` : '';
       if (retryable && attempt < limit && !(hint && hint > 5 * 60_000)) {
-        await this.backoff(attempt, hint, label, res.status === 429 ? 'limite di richieste' : `errore ${res.status}`);
+        await this.backoff(attempt, hint, label, `${res.status === 429 ? 'limite di richieste' : `errore ${res.status}`}${after}`);
         continue;
       }
-      throw new ApiError(msg, res.status, body);
+      const err = new ApiError(msg, res.status, body);
+      err.tookMs = took;
+      throw err;
     }
   }
 

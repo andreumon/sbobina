@@ -6,7 +6,7 @@
 // della lezione (vedi strategy.js) e l'elaborazione riprende con la variante che funziona.
 import * as store from './store.js';
 import { analyzeAdts, planChunks, probeDuration, sliceParts } from './aac.js';
-import { Gemini, ApiError, blobToBase64, isKeyError } from './gemini.js';
+import { Gemini, ApiError, blobToBase64, isKeyError, fmtDur } from './gemini.js';
 import { transcriptionPrompt, revisionPrompt, continuationPrompt, langOf } from './prompts.js';
 import * as quota from './quota.js';
 import { paragraphsFromChunk, paragraphsFromRaw, completenessCheck, glossaryTerms, fmtTime, countWords, coverageWarnings } from './text.js';
@@ -56,7 +56,23 @@ function tailOf(chunk, chars = 450) {
  * @param {string} id  lezione
  * @param {object} ctx { settings, getAudio(job), log(msg), signal, onProgress(info), onChunkDone(job, i) }
  */
+/**
+ * Elabora una lezione. Mentre lavora rinnova ogni minuto e mezzo il "battito" della lezione:
+ * così l'altro dispositivo non la crede ferma durante le attese lunghe (limiti al minuto,
+ * revisioni che durano qualche minuto) e non propone "Continua qui".
+ */
 export async function processJob(id, ctx) {
+  const beat = setInterval(() => {
+    store.updateJob(id, j => { if (j.status === 'running' && j.runner === store.deviceId) j.heartbeat = Date.now(); }).catch(() => {});
+  }, 90_000);
+  try {
+    return await runJob(id, ctx);
+  } finally {
+    clearInterval(beat);
+  }
+}
+
+async function runJob(id, ctx) {
   const { settings, signal } = ctx;
   const log = msg => {
     ctx.log?.(msg);
@@ -181,6 +197,11 @@ export async function processJob(id, ctx) {
       blob = wavCache.get(i);
       mime = 'audio/wav';
     } else if (lightForGemini && chunk.mode !== 'range') {
+      // Audio leggero già caricato su Google (anche da un'esecuzione precedente, es. dopo che
+      // il telefono ha chiuso l'app): si riusa senza riconvertire.
+      const h = chunk.mode === 'slice' ? chunk : job;
+      const up = transport !== 'inline' && h.grefs?.[quota.scoped('ogg', k.tag)];
+      if (up?.uri && Date.now() - (up.at || 0) < GEMINI_FILE_TTL) return { uri: up.uri, mimeType: 'audio/ogg' };
       const light = await lightFor(i);
       if (light) { blob = light; mime = 'audio/ogg'; kind = 'ogg'; }
     }
@@ -194,8 +215,10 @@ export async function processJob(id, ctx) {
     const holder = chunk.mode === 'slice' ? chunk : job;
     const cached = holder.grefs?.[key];
     if (cached?.uri && Date.now() - (cached.at || 0) < GEMINI_FILE_TTL) return { uri: cached.uri, mimeType: mime };
+    const tUp = Date.now();
     const f = await k.gemini.upload(blob, mime, chunk.mode === 'slice' ? `${job.title} - parte ${i + 1}` : job.title,
       p => progress({ step: 'upload', chunk: i, total: job.chunks.length, progress: p }));
+    await log(`Blocco ${i + 1}: audio inviato a Gemini (${mb(blob.size)}) in ${fmtDur(Date.now() - tUp)}`);
     const refData = { name: f.name, uri: f.uri, at: Date.now() };
     job = await patch(j => {
       const h = chunk.mode === 'slice' ? j.chunks[i] : j;
@@ -243,8 +266,13 @@ export async function processJob(id, ctx) {
         const r = await groq.transcribe({ blob, language: whisperLanguage(lang), prompt: whisperPrompt(vocabulary, lang) });
         recordGroq(secs);
         const segments = Array.isArray(r.segments) ? r.segments : [{ start: 0, end: secs, text: r.text || '' }];
-        const { raw, dropped } = rawFromSegments(segments);
-        if (dropped) await log(`Blocco ${i + 1}: scartati ${dropped} pezzi che Whisper aveva probabilmente inventato nei silenzi`);
+        const { raw, dropped, droppedItems } = rawFromSegments(segments);
+        if (dropped) {
+          // Elenco completo nel registro, per poter controllare che il filtro non abbia tolto parlato vero
+          const t0 = job.chunks[i].start;
+          const list = droppedItems.map(d => `[${fmtTime(t0 + d.start, (job.duration || 0) >= 3600)}] «${d.text.slice(0, 60)}» (${d.why})`).join('; ');
+          await log(`Blocco ${i + 1}: scartati ${dropped} pezzi che Whisper aveva probabilmente inventato nei silenzi: ${list}`);
+        }
         return { raw, engine: `${GROQ_MODEL} (Groq)` };
       } catch (e) {
         if (e.name === 'AbortError') throw e;
@@ -315,7 +343,9 @@ export async function processJob(id, ctx) {
         await waitFor(wait, info);
       }
       try {
+        const tCall = Date.now();
         const text = await call(pick);
+        const ms = Date.now() - tCall;
         quota.record(pick.qid, tokens);
         offlineUntil.delete(pick.key.tag);
         gemini = pick.key.gemini;
@@ -323,7 +353,7 @@ export async function processJob(id, ctx) {
           lastKeyTag = pick.key.tag;
           await log(`${label}: ora uso la ${pick.key.name}`);
         }
-        return { text, model: pick.model };
+        return { text, model: pick.model, ms };
       } catch (e) {
         if (e.name === 'AbortError') throw e;
         const others = liveKeys().filter(k => k !== pick.key);
@@ -353,7 +383,12 @@ export async function processJob(id, ctx) {
           await log(`${label}: ${who(pick)} al limite al minuto (libero tra ${Math.ceil(c.waitMs / 1000)} s)${next()}`);
           continue;
         }
-        if (c.kind === 'overload') { await log(`${label}: ${who(pick)} sovraccarico, lo salto per qualche minuto`); continue; }
+        if (c.kind === 'overload') {
+          // Il sovraccarico è del modello, sui server di Google, non della chiave: lo si salta per tutte.
+          for (const k of keys) if (k !== pick.key) quota.onError(quota.scoped(pick.model, k.tag), e);
+          await log(`${label}: ${pick.model} sovraccarico${e.tookMs >= 5000 ? ` (risposto dopo ${fmtDur(e.tookMs)})` : ''}, lo salto per qualche minuto`);
+          continue;
+        }
         if (e instanceof ApiError && [403, 404].includes(e.status) && pick.model !== candidates[0].model) {
           missing.add(pick.qid);
           continue;
@@ -439,9 +474,9 @@ export async function processJob(id, ctx) {
             call: async c => {
               progress({ step: 'transcribe', ...info, model: c.model, reserve: c.key.tag !== '' });
               if (c.kind === 'transcribe') {
-                return withLightFallback(async () => c.key.gemini.transcribe({ model: c.model, audio: await audioFor(i, strategy.transcribe, c.key), language: lang.codes, vocabulary: strategy.transcribe.vocab ? vocabulary : [], maxOutputTokens: 32768 }));
+                return withLightFallback(async () => c.key.gemini.transcribe({ model: c.model, audio: await audioFor(i, strategy.transcribe, c.key), language: lang.codes, vocabulary: strategy.transcribe.vocab ? vocabulary : [], maxOutputTokens: 32768, overloadRetries: 0 }));
               }
-              return withLightFallback(async () => c.key.gemini.generate({ model: c.model, audio: await audioFor(i, strategy.revise, c.key), endpoint: strategy.revise.endpoint, label: 'Trascrizione', config: GEN_CONFIG,
+              return withLightFallback(async () => c.key.gemini.generate({ model: c.model, audio: await audioFor(i, strategy.revise, c.key), endpoint: strategy.revise.endpoint, label: 'Trascrizione', config: GEN_CONFIG, overloadRetries: 0,
                 prompt: transcriptionPrompt({ course: job.course, glossary: glossaryText, range, lang }) }));
             },
           }));
@@ -453,7 +488,7 @@ export async function processJob(id, ctx) {
             const { text: more } = await runStep({
               label: 'Trascrizione', candidates: chain.map(model => ({ model, kind: 'generate' })), tokens: quota.estimateTokens(secs), info,
               call: async c => withLightFallback(async () => c.key.gemini.generate({ model: c.model, audio: await audioFor(i, strategy.revise, c.key), endpoint: strategy.revise.endpoint,
-                label: 'Trascrizione', config: GEN_CONFIG, prompt: continuationPrompt({ course: job.course, glossary: glossaryText, tail, lang }) })),
+                label: 'Trascrizione', config: GEN_CONFIG, overloadRetries: 0, prompt: continuationPrompt({ course: job.course, glossary: glossaryText, tail, lang }) })),
             });
             if (!stripFences(more)) break;
             raw = `${raw}\n\n${stripFences(more)}`;
@@ -476,12 +511,12 @@ export async function processJob(id, ctx) {
           start: chunk.start, end: chunk.end, prevTail: i > 0 ? tailOf(job.chunks[i - 1]) : '',
           withAudio, range: chunk.mode === 'range' ? [chunk.start, chunk.end] : null,
         });
-        const { text, model } = await runStep({
+        const { text, model, ms: revMs } = await runStep({
           label: 'Revisione', candidates: chain.map(m => ({ model: m, kind: 'generate' })),
           tokens: quota.estimateTokens(withAudio ? chunk.end - chunk.start : 0, prompt.length), info,
           call: async c => {
             progress({ step: 'revise', ...info, model: c.model, reserve: c.key.tag !== '' });
-            return withLightFallback(async () => c.key.gemini.generate({ model: c.model, prompt, endpoint: strategy.revise.endpoint, label: 'Revisione', config: GEN_CONFIG,
+            return withLightFallback(async () => c.key.gemini.generate({ model: c.model, prompt, endpoint: strategy.revise.endpoint, label: 'Revisione', config: GEN_CONFIG, overloadRetries: 0,
               audio: withAudio ? await audioFor(i, strategy.revise, c.key) : null }));
           },
         });
@@ -493,10 +528,10 @@ export async function processJob(id, ctx) {
         const warns = [];
         if (truncated) warns.push('La revisione si è interrotta prima della fine del blocco: la parte finale è solo nella versione grezza.');
         else if (check.warn) warns.push(check.warn);
-        if (withAudio) warns.push(...coverageWarnings(paragraphs, chunk.start, chunk.end, job.duration));
+        warns.push(...coverageWarnings(paragraphs, chunk.start, chunk.end, job.duration, chunk.raw));
         const warn = warns.join(' ') || null;
         if (warn) await log(`Blocco ${i + 1}: ${warn}`);
-        if (model !== settings.reviseModel || lastKeyTag) await log(`Blocco ${i + 1}: rivisto con ${model}${lastKeyTag ? ' (chiave di riserva)' : ''}`);
+        await log(`Blocco ${i + 1}: rivisto con ${model}${lastKeyTag ? ' (chiave di riserva)' : ''} in ${fmtDur(revMs)}`);
         job = await patch(j => { Object.assign(j.chunks[i], { revised, paragraphs, ratio: check.ratio, warn, reviseEngine: model }); });
       } else {
         job = await patch(j => { const c = j.chunks[i]; c.paragraphs = paragraphsFromRaw(c.raw || '', c.start); });

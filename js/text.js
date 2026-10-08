@@ -198,22 +198,61 @@ export function glossaryTerms(glossary) {
  * lunghi di quanto servirebbe a pronunciare il primo (circa 150 parole al minuto), e un
  * finale di blocco senza testo. Restituisce frasi da mostrare all'utente.
  */
-export function coverageWarnings(paragraphs, start, end, lectureDuration = end) {
+/**
+ * Parole del grezzo (con i tempi di Whisper) che cadono nell'intervallo [a, b] di secondi assoluti.
+ * Ogni pezzo del grezzo occupa dal suo inizio per il tempo che serve a pronunciarlo (~2,5 parole
+ * al secondo), senza superare l'inizio del pezzo successivo: così i silenzi tra un pezzo e
+ * l'altro restano vuoti.
+ */
+function rawWordsIn(rawTimed, a, b) {
+  let n = 0;
+  rawTimed.forEach((p, k) => {
+    const w = countWords(p.text);
+    const next = rawTimed[k + 1]?.t ?? Infinity;
+    const s = p.t, e = Math.min(next, p.t + Math.max(2, w / 2.5));
+    const overlap = Math.max(0, Math.min(b, e) - Math.max(a, s));
+    if (overlap > 0) n += w * (overlap / (e - s));
+  });
+  return Math.round(n);
+}
+
+/**
+ * Cerca possibili parti mancanti nella revisione: intervalli tra due paragrafi molto più
+ * lunghi di quanto servirebbe a pronunciare il primo (circa 150 parole al minuto), e un
+ * finale di blocco senza testo. Se il grezzo ha i tempi (Whisper), ogni intervallo si
+ * confronta con il grezzo: se lì il grezzo è vuoto era una pausa vera e non si segnala;
+ * se il grezzo ha parole, la revisione le ha probabilmente saltate e lo si dice.
+ * Restituisce frasi da mostrare all'utente.
+ */
+export function coverageWarnings(paragraphs, start, end, lectureDuration = end, rawText = '') {
   const timed = paragraphs.filter(p => p.t !== null && p.t !== undefined);
   if (timed.length < 2) return [];
   const long = lectureDuration >= 3600;
   const ts = t => `[${fmtTime(t, long || t >= 3600)}]`;
-  const out = [];
+  const min = sec => String(Math.round(sec / 6) / 10).replace('.', ',');
+  const rawAll = rawText ? paragraphsFromRaw(rawText, start) : [];
+  const rawTimed = rawAll.filter((p, k) => k > 0 && p.t !== null).length >= 2 ? rawAll.filter(p => p.t !== null) : null;
+  const gaps = [];
   for (let k = 0; k < timed.length - 1; k++) {
     const a = timed[k], b = timed[k + 1];
     const spoken = countWords(a.text) / 2.5; // secondi stimati per dirlo
     const gap = b.t - a.t;
-    if (gap > Math.max(100, spoken * 2 + 45)) out.push(`tra ${ts(a.t)} e ${ts(b.t)} (${String(Math.round((gap - spoken) / 6) / 10).replace('.', ',')} min senza testo)`);
+    if (gap > Math.max(100, spoken * 2 + 45)) gaps.push({ from: a.t + spoken, to: b.t, label: `tra ${ts(a.t)} e ${ts(b.t)}`, len: gap - spoken });
   }
   const last = timed[timed.length - 1];
-  const tail = end - last.t - countWords(last.text) / 2.5;
-  if (tail > 120) out.push(`dopo ${ts(last.t)} fino alla fine del blocco (${String(Math.round(tail / 6) / 10).replace('.', ',')} min)`);
-  if (!out.length) return [];
-  const shown = out.length > 3 ? [...out.slice(0, 3), `e altri ${out.length - 3} intervalli`] : out;
-  return [`Possibili parti non trascritte: ${shown.join('; ')}. Potrebbero essere pause o silenzi: ascolta per verificare.`];
+  const lastEnd = last.t + countWords(last.text) / 2.5;
+  if (end - lastEnd > 120) gaps.push({ from: lastEnd, to: end, label: `dopo ${ts(last.t)} fino alla fine del blocco`, len: end - lastEnd });
+
+  const missing = [], unsure = [];
+  for (const g of gaps) {
+    if (!rawTimed) { unsure.push(`${g.label} (${min(g.len)} min senza testo)`); continue; }
+    const words = rawWordsIn(rawTimed, g.from, g.to);
+    // Parlato normale: almeno ~1 parola al secondo. Molto meno = pausa, esercizio, lavagna.
+    if (words >= Math.max(25, (g.to - g.from) * 0.25)) missing.push(`${g.label} (${min(g.len)} min: nel grezzo ci sono circa ${words} parole)`);
+  }
+  const list = arr => (arr.length > 3 ? [...arr.slice(0, 3), `e altri ${arr.length - 3} intervalli`] : arr).join('; ');
+  const out = [];
+  if (missing.length) out.push(`Parti probabilmente saltate dalla revisione: ${list(missing)}. Confronta con la scheda Grezza o ascolta.`);
+  if (unsure.length) out.push(`Possibili parti non trascritte: ${list(unsure)}. Potrebbero essere pause o silenzi: ascolta per verificare.`);
+  return out;
 }
