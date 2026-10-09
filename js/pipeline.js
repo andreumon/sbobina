@@ -19,9 +19,17 @@ import {
 const GEMINI_FILE_TTL = 46 * 3600 * 1000; // Google li tiene 48 ore
 const MAX_REQUEST_SEC = 54 * 60;           // limite del modello di trascrizione: 1 ora
 const PLAN_VERSION = 2;                    // 2: esclude il frame finto iniziale del registratore
-// Modelli gratuiti, provati in ordine quando quello scelto è sovraccarico o ha finito la quota.
-// I "lite" hanno quote giornaliere molto più alte: sono l'ultima riserva.
-export const FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
+// Modelli per trascrizione (se Groq non c'è) e revisione, in ordine di priorità: si usano i più
+// capaci finché sono disponibili; 3.6 e 3.5 solo se 3.8 e 3.7 sono sovraccarichi o senza quota
+// (il registro dice sempre quale modello ha rivisto ogni blocco). I "lite" non toccano mai il
+// testo della lezione: servono solo per l'indice.
+export const FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash'];
+/** Modalità "solo i modelli migliori" delle revisioni chieste a mano. */
+export const STRONG_MODELS = ['gemini-3.8-flash', 'gemini-3.7-flash'];
+export const REDO_MAX_MS = 30 * 60_000;
+
+/** Nuova revisione di tutto il testo "solo 3.8 e 3.7": scaduto il tempo massimo senza riuscirci. */
+class RedoExpired extends Error {}
 const GEN_CONFIG = { maxOutputTokens: 32768, thinkingLevel: 'low' };
 const MAX_INLINE_WAIT = 6 * 60_000;        // oltre questa attesa la lezione va "in attesa" e libera la coda
 const SWITCH_IF_WAIT = 2 * 60_000;         // se un modello va atteso più di così, si preferisce un altro libero
@@ -67,6 +75,18 @@ export async function processJob(id, ctx) {
   }, 90_000);
   try {
     return await runJob(id, ctx);
+  } catch (e) {
+    if (!(e instanceof RedoExpired)) throw e;
+    // Si torna al testo di prima, intatto.
+    const job = await store.updateJob(id, j => {
+      const back = j.prevVersions?.[0];
+      if (back?.paragraphs) j.edited = { paragraphs: back.paragraphs.map(p => ({ ...p })), at: Date.now(), partial: !!back.partial };
+      j.notice = 'Nuova revisione di tutto il testo annullata: gemini-3.8-flash e 3.7-flash non sono stati disponibili per 30 minuti. Il testo è rimasto quello di prima.';
+      j.log = [...(j.log || []).slice(-399), `${new Date().toLocaleTimeString('it-IT')} ${j.notice}`];
+      j.status = 'done'; j.error = null; delete j.redo; delete j.runner; delete j.retryAt;
+    });
+    ctx.onProgress?.({ id, step: 'done' });
+    return job;
   } finally {
     clearInterval(beat);
   }
@@ -76,7 +96,7 @@ async function runJob(id, ctx) {
   const { settings, signal } = ctx;
   const log = msg => {
     ctx.log?.(msg);
-    return store.updateJob(id, j => { j.log = [...(j.log || []).slice(-80), `${new Date().toLocaleTimeString('it-IT')} ${msg}`]; }, { touch: false });
+    return store.updateJob(id, j => { j.log = [...(j.log || []).slice(-399), `${new Date().toLocaleTimeString('it-IT')} ${msg}`]; }, { touch: false });
   };
   // ---- Chiavi API: la principale e, se impostata, quella di riserva.
   // Ogni chiave (di un progetto Google diverso) ha quote proprie: quando la principale è
@@ -104,6 +124,7 @@ async function runJob(id, ctx) {
 
   let job = await patch(j => {
     j.status = 'running'; j.error = null; j.runner = store.deviceId; j.heartbeat = Date.now();
+    if (!j.startedAt) j.startedAt = Date.now();
   });
   const audio = await ctx.getAudio(job);
   if (!audio) throw new Error('L\'audio di questa lezione non è disponibile su questo dispositivo.');
@@ -291,7 +312,13 @@ async function runJob(id, ctx) {
   };
 
   // ---- Dosatore: sceglie il modello, rispetta le quote, ricorda chi è esaurito o sovraccarico
-  const chain = [settings.reviseModel, ...FALLBACK_MODELS.filter(m => m !== settings.reviseModel)];
+  // Nuova revisione di tutto il testo chiesta a mano: eventualmente solo con i modelli migliori, entro un tempo massimo.
+  const redo = job.redo || null;
+  const strongOnly = redo?.mode === 'strong';
+  const pool = strongOnly ? STRONG_MODELS : FALLBACK_MODELS;
+  const chain = [...(pool.includes(settings.reviseModel) || !strongOnly ? [settings.reviseModel] : []), ...pool.filter(m => m !== settings.reviseModel)];
+  if (redo) await log(`Nuova revisione di tutto il testo ${strongOnly ? 'solo con gemini-3.8-flash e 3.7-flash (al massimo 30 minuti di attesa)' : 'con i modelli migliori disponibili'}`);
+  const pastDeadline = t => strongOnly && redo.until && t > redo.until;
   const missing = new Set(); // modello@chiave che non esistono per quella chiave (404)
   const waitFor = async (ms, info) => {
     const until = Date.now() + ms;
@@ -312,12 +339,21 @@ async function runJob(id, ctx) {
     const who = c => (keys.length > 1 ? `${c.model} (${c.key.name})` : c.model);
     for (;;) {
       if (signal?.aborted) throw new DOMException('Interrotto', 'AbortError');
-      const alive = pairs.filter(c => !deadKeys.has(c.key.tag) && !missing.has(c.qid) && (minuteHits.get(c.qid) || 0) < 2);
+      let alive = pairs.filter(c => !deadKeys.has(c.key.tag) && !missing.has(c.qid) && (minuteHits.get(c.qid) || 0) < 2);
+      if (!alive.length && strongOnly && pairs.some(c => !missing.has(c.qid) && !deadKeys.has(c.key.tag))) {
+        // In modalità "solo i migliori" i limiti al minuto non fanno arrendere: si aspetta e si riprova.
+        if (pastDeadline(Date.now() + 60_000)) throw new RedoExpired();
+        minuteHits.clear();
+        await log(`${label}: 3.8 e 3.7 al limite al minuto, riprovo tra 60 s`);
+        await waitFor(60_000, info);
+        continue;
+      }
       if (!alive.length) throw new ApiError(`${label}: nessun modello utilizzabile.`, 503);
       const ready = alive.filter(c => keyUp(c.key) && quota.usable(c.qid));
       if (!ready.length) {
         const at = Math.min(...alive.map(c => Math.max(quota.availableAt(c.qid), offlineUntil.get(c.key.tag) || 0)));
         const wait = at - Date.now();
+        if (pastDeadline(at)) throw new RedoExpired();
         if (wait <= MAX_INLINE_WAIT) {
           await log(`${label}: tutti i modelli in pausa, riprovo tra ${Math.ceil(wait / 1000)} s`);
           await waitFor(wait, info);
@@ -502,7 +538,7 @@ async function runJob(id, ctx) {
       }
 
       // Revisione
-      if (settings.revise && chunk.raw) {
+      if ((settings.revise || redo) && chunk.raw) {
         const info = { chunk: i, total };
         const withAudio = !!settings.relisten;
         progress({ step: 'revise', ...info });
@@ -558,6 +594,8 @@ async function runJob(id, ctx) {
   for (const [k, g] of Object.entries(job.grefs || {})) await dropRef(k, g);
   job = await patch(j => {
     j.status = 'done'; j.finishedAt = Date.now(); j.error = null; delete j.grefs; delete j.gfile; delete j.runner;
+    if (j.redo) j.notice = 'Nuova revisione di tutto il testo completata. La versione di prima si può ripristinare da Dettagli.';
+    delete j.redo;
   });
   progress({ step: 'done' });
   return job;

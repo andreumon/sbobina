@@ -17,6 +17,7 @@ import { LANGS } from './prompts.js';
 import * as quota from './quota.js';
 import { Groq, explainGroq, groqUsage, GROQ_DAILY_SEC } from './groq.js';
 import { canMakeLight } from './light.js';
+import { makeIndex, rereviewParagraph, wordDiff, searchLectures, foldChar, fold } from './assist.js';
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -231,6 +232,9 @@ async function openCourse(name, { push = true } = {}) {
   $('courseSave').textContent = course ? 'Salva modifiche' : 'Crea corso';
   $('courseDelete').hidden = !course;
   $('courseAddRec').hidden = !course;
+  $('courseSearchBox').hidden = !course;
+  $('courseSearch').value = '';
+  $('courseSearchResults').innerHTML = '';
   const jobs = course ? (await store.listJobs()).filter(j => j.course === course.name) : [];
   $('courseLectures').innerHTML = course
     ? (jobs.length ? `<h3>Lezioni</h3><ol>${jobs.map(lectureRow).join('')}</ol>` : '<p class="help">Ancora nessuna lezione in questo corso.</p>')
@@ -658,7 +662,11 @@ async function openLecture(id, { push = true, replace = false } = {}) {
   const changed = state.jobId !== id;
   show('lecture');
   state.jobId = id;
-  if (changed) { state.tab = 'revised'; state.userTab = false; state.editing = false; state.qpop = null; state.pedit = null; $('moveRow').hidden = true; }
+  if (changed) {
+    state.tab = 'revised'; state.userTab = false; state.editing = false; state.qpop = null; state.pedit = null;
+    state.tocClosed = false; $('tocBack').hidden = true; closeSearch();
+    $('moveRow').hidden = true;
+  }
   if (push) history[replace ? 'replaceState' : 'pushState']({ v: 'lecture', id }, '');
   markCurrentRow();
   player.prepare({
@@ -712,10 +720,15 @@ async function renderLecture(job) {
   else if (!state.userTab) state.tab = 'revised';
   document.querySelectorAll('#lecTabs [role="tab"]').forEach(t => t.setAttribute('aria-selected', String(t.dataset.tab === state.tab)));
 
+  if (state.editing) closeSearch();
   $('editorWrap').hidden = !state.editing;
   $('transcript').hidden = state.editing;
   if (state.editing) { closePoint(); renderPointsPill(); }
   else if (!state.pedit) renderTranscript(job); // con un paragrafo in modifica il testo resta com'è
+  renderToc(job);
+  $('lecActions').querySelector('[data-act="index"]').hidden = job.status !== 'done';
+  $('lecActions').querySelector('[data-act="redo"]').hidden = job.status !== 'done';
+  $('searchCourse').textContent = job.course ? `Cerca in tutto il corso «${job.course}»` : 'Cerca in tutte le lezioni senza corso';
 }
 
 function renderStatus(job) {
@@ -726,7 +739,17 @@ function renderStatus(job) {
     const box = $('lecStatus');
     const p = state.progress[job.id];
     const mine = state.runner?.id === job.id;
-    if (job.status === 'done' && !mine) { box.hidden = true; return; }
+    if (job.status === 'done' && !mine) {
+      box.hidden = !job.notice;
+      if (job.notice) {
+        box.classList.remove('error');
+        $('statusText').textContent = job.notice;
+        $('statusActions').innerHTML = '<button type="button" class="btn" data-run="ok-notice">OK</button>';
+        $('progressFill').style.width = '0';
+        box.querySelector('.log').hidden = true;
+      }
+      return;
+    }
     box.hidden = false;
     box.classList.toggle('error', job.status === 'error');
     let text = '', actions = '';
@@ -743,6 +766,10 @@ function renderStatus(job) {
       text = job.waitDaily
         ? `Quota gratuita di oggi esaurita su tutti i modelli. Riprendo da solo ${tomorrow ? 'domani ' : ''}alle ${at}, con l'app aperta.`
         : `Google è sovraccarico. Riprovo da solo alle ${at}, con l'app aperta.`;
+      if (job.redo?.mode === 'strong' && job.redo.until) {
+        const until = new Date(job.redo.until).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
+        text = `Nuova revisione solo con 3.8 e 3.7: entrambi occupati. Riprovo da solo alle ${at}, al massimo fino alle ${until}; poi il testo resta quello di prima.`;
+      }
       actions = '<button type="button" class="btn" data-run="resume">Riprova ora</button>';
     } else if (job.status === 'paused') {
       text = 'Elaborazione in pausa.';
@@ -770,6 +797,7 @@ $('statusActions').addEventListener('click', async e => {
   if (!b) return;
   const id = state.jobId;
   if (b.dataset.run === 'stop') state.runner?.abort.abort();
+  else if (b.dataset.run === 'ok-notice') { await store.updateJob(id, j => { delete j.notice; }); renderLecture(); }
   else {
     if (b.dataset.run === 'takeover' || b.dataset.run === 'resume') {
       if (!drive.connected && drive.configured && !(await store.getAudio(id))) {
@@ -847,6 +875,7 @@ function renderTranscript(job) {
   if (/\$[^$]+\$/.test(art.textContent)) renderMath(art);
   // Fumetto o editor aperti prima dell'aggiornamento: si rimettono al loro posto.
   if (state.qpop && state.tab === 'revised') attachQpop(qFocus);
+  if (state.search?.q) applySearch({ keep: true });
 }
 
 /**
@@ -1118,6 +1147,12 @@ async function openParaEditor(i, { keepLoop = false } = {}) {
         <button type="button" class="primary" data-pe="save">Salva</button>
       </div>
     </div>
+    <div class="pedit-redo-row">
+      <button type="button" class="quiet pedit-redo" data-pe="rereview">↻ Fai rivedere a Gemini questo paragrafo</button>
+      ${modeSelect('peditMode')}
+    </div>
+    <p class="pedit-wait" id="peditWait" hidden></p>
+    <div class="pedit-proposal" id="peditProposal" hidden></div>
     <p class="help">Una riga vuota divide il paragrafo in due. Su PC: Ctrl+Invio salva, Esc annulla.</p>`;
   para.hidden = true;
   para.after(box);
@@ -1133,6 +1168,7 @@ async function openParaEditor(i, { keepLoop = false } = {}) {
 
 function closeParaEditor(rerender = true) {
   if (!state.pedit) return;
+  state.pedit.abort?.abort();
   const { i } = state.pedit;
   state.pedit = null;
   $('pedit')?.remove();
@@ -1168,8 +1204,84 @@ $('transcript').addEventListener('click', async e => {
       break;
     case 'back': player.skip(-5); break;
     case 'fwd': player.skip(5); break;
+    case 'rereview': await rereviewCurrent(b); break;
+    case 'accept': {
+      const text = state.pedit.proposal;
+      state.pedit = null;
+      if (loop) { player.clearLoop(); player.pause(); }
+      await saveParagraph(i, text);
+      toast('Nuova versione salvata');
+      break;
+    }
+    case 'edit-new': {
+      $('peditText').value = state.pedit.proposal;
+      $('peditText').dispatchEvent(new Event('input'));
+      $('peditProposal').hidden = true;
+      break;
+    }
+    case 'reject': $('peditProposal').hidden = true; break;
+    case 'stop': state.pedit.abort?.abort(); break;
   }
 });
+
+/** Nuova revisione del paragrafo in modifica: riascolta solo il suo tratto e propone il testo, con le differenze. */
+async function rereviewCurrent(btn) {
+  const { i } = state.pedit;
+  const job = await store.getJob(state.jobId);
+  if (!job || !settings.apiKey) { toast('Manca la chiave API Gemini.'); return; }
+  const mode = $('peditMode').value;
+  store.device.set('reviewMode', mode);
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Recupero l\'audio del tratto…';
+  const abort = new AbortController();
+  state.pedit.abort = abort;
+  const wait = $('peditWait');
+  try {
+    let audio = null;
+    try { audio = await loadAudio(job.id); } catch { /* senza audio: revisione sul solo testo */ }
+    btn.textContent = audio ? 'Gemini riascolta il tratto…' : 'Gemini rivede il testo (audio non disponibile)…';
+    const current = $('peditText').value;
+    const hhmm = t => new Date(t).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
+    const res = await rereviewParagraph(job, i, settings, audio, {
+      text: current, mode, signal: abort.signal,
+      onWait: (next, deadline) => {
+        wait.hidden = false;
+        wait.innerHTML = `3.8 e 3.7 occupati: riprovo alle ${hhmm(next)} (al massimo fino alle ${hhmm(deadline)}). <button type="button" class="quiet" data-pe="stop">Annulla</button>`;
+      },
+    });
+    if (!state.pedit || state.pedit.i !== i) return; // editor chiuso nel frattempo
+    state.pedit.proposal = res.text;
+    const long = (job.duration || 0) >= 3600;
+    const diff = wordDiff(current, res.text).map(d => (d.type === 'same' ? esc(d.text) : `<${d.type}>${esc(d.text)}</${d.type}>`)).join('');
+    const same = res.text.trim() === current.trim();
+    const box = $('peditProposal');
+    box.innerHTML = `<p class="pedit-proposal-head">${same ? 'Nessuna differenza' : 'Nuova versione'}: ${esc(res.model)}${res.withAudio ? `, riascoltando ${fmtTime(res.from, long)}–${fmtTime(res.to, long)}` : ', solo sul testo'}</p>
+      ${same ? '' : `<p class="diff">${diff}</p>`}
+      <div class="pedit-proposal-actions">
+        ${same ? '' : '<button type="button" class="primary" data-pe="accept">Accetta</button><button type="button" data-pe="edit-new">Modifica</button>'}
+        <button type="button" class="quiet" data-pe="reject">${same ? 'Chiudi' : 'Tieni la vecchia'}</button>
+      </div>`;
+    box.hidden = false;
+    box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  } catch (e) {
+    if (e.name !== 'AbortError') toast(e.status !== undefined ? explainError(e) : e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+    wait.hidden = true;
+    if (state.pedit) state.pedit.abort = null;
+  }
+}
+
+/** Scelta dei modelli per le revisioni chieste a mano (si ricorda l'ultima usata). */
+function modeSelect(id) {
+  const m = store.device.get('reviewMode', 'best');
+  return `<select id="${id}" class="mode-select" aria-label="Modelli da usare">
+    <option value="best"${m === 'best' ? ' selected' : ''}>Modelli migliori disponibili (3.8 → 3.5)</option>
+    <option value="strong"${m === 'strong' ? ' selected' : ''}>Solo 3.8 e 3.7 (riprova fino a 30 min)</option>
+  </select>`;
+}
 $('transcript').addEventListener('keydown', e => {
   if (e.target.id !== 'peditText') return;
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); document.querySelector('#pedit [data-pe="save"]').click(); }
@@ -1190,6 +1302,297 @@ function scheduleFileUpdate(job) {
       if (exists || store.device.get('folderAuto', false)) await writeToFolder(await store.getJob(job.id), handle, false);
     } catch (err) { console.warn(err); }
   }, 2500);
+}
+
+// ====================================================================
+// Ricerca: nella lezione aperta (evidenziando le occorrenze) e in tutte le lezioni del corso
+// ====================================================================
+
+function clearHits() {
+  for (const m of $('transcript').querySelectorAll('mark.hit')) {
+    const parent = m.parentNode;
+    while (m.firstChild) parent.insertBefore(m.firstChild, m);
+    parent.removeChild(m);
+    parent.normalize();
+  }
+}
+
+/** Evidenzia le occorrenze di state.search.q nel testo mostrato (senza distinguere maiuscole e accenti). */
+function applySearch({ keep = false, para = null } = {}) {
+  const st = state.search;
+  if (!st) return;
+  clearHits();
+  st.hits = [];
+  const fq = fold(st.q.trim());
+  if (fq.length >= 2) {
+    const walker = document.createTreeWalker($('transcript'), NodeFilter.SHOW_TEXT, {
+      acceptNode: n => (n.parentElement.closest('.ts, .katex, #qpop, .pedit, .chunk-label, script, style') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
+    });
+    const nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+    for (const node of nodes) {
+      const ft = Array.from(node.data, foldChar).join('');
+      // Array.from conta i caratteri "doppi" (emoji) come uno: si torna agli indici della stringa
+      const map = []; let pos = 0;
+      for (const ch of node.data) { map.push(pos); pos += ch.length; }
+      map.push(pos);
+      const found = [];
+      let k = ft.indexOf(fq);
+      while (k >= 0) { found.push(k); k = ft.indexOf(fq, k + fq.length); }
+      let cur = node;
+      let consumed = 0;
+      for (const f of found) {
+        const start = map[f] - consumed, end = map[f + fq.length] - consumed;
+        const mid = cur.splitText(start);
+        const rest = mid.splitText(end - start);
+        const mark = document.createElement('mark');
+        mark.className = 'hit';
+        mid.parentNode.insertBefore(mark, mid);
+        mark.appendChild(mid);
+        st.hits.push(mark);
+        cur = rest;
+        consumed = map[f + fq.length];
+      }
+    }
+  }
+  if (!st.hits.length) st.cur = -1;
+  else if (para !== null) {
+    const k = st.hits.findIndex(h => h.closest('.para')?.dataset.i === String(para));
+    st.cur = k >= 0 ? k : 0;
+  } else if (keep && st.cur >= 0) st.cur = Math.min(st.cur, st.hits.length - 1);
+  else {
+    // Il primo risultato a partire da dove si sta leggendo
+    const k = st.hits.findIndex(h => h.getBoundingClientRect().top >= 80);
+    st.cur = k >= 0 ? k : 0;
+  }
+  showHit(!keep);
+}
+
+function showHit(scroll = true) {
+  const st = state.search;
+  const n = st?.hits?.length || 0;
+  $('searchCount').textContent = !st || fold(st.q.trim()).length < 2 ? '' : n ? `${st.cur + 1} di ${n}` : 'nessun risultato';
+  $('searchPrev').disabled = $('searchNext').disabled = n < 2;
+  st?.hits?.forEach((h, k) => h.classList.toggle('now', k === st.cur));
+  if (scroll && n) st.hits[st.cur].scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function openSearch(q = null, { para = null } = {}) {
+  closePoint();
+  state.search = state.search || { q: '', hits: [], cur: -1 };
+  if (q !== null) { state.search.q = q; $('searchInput').value = q; }
+  $('searchBar').hidden = false;
+  if (q === null) { $('searchInput').focus(); $('searchInput').select(); }
+  if (state.search.q) applySearch({ para });
+}
+
+function closeSearch() {
+  if (!state.search) return;
+  clearHits();
+  state.search = null;
+  $('searchBar').hidden = true;
+  $('searchCount').textContent = '';
+}
+
+$('searchBtn').addEventListener('click', () => (state.search ? closeSearch() : openSearch()));
+$('searchClose').addEventListener('click', closeSearch);
+let searchTimer;
+$('searchInput').addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => { if (state.search) { state.search.q = $('searchInput').value; applySearch(); } }, 200);
+});
+const stepHit = d => {
+  const st = state.search;
+  if (!st?.hits?.length) return;
+  st.cur = (st.cur + d + st.hits.length) % st.hits.length;
+  showHit();
+};
+$('searchNext').addEventListener('click', () => stepHit(1));
+$('searchPrev').addEventListener('click', () => stepHit(-1));
+$('searchInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); clearTimeout(searchTimer); if (state.search.q !== $('searchInput').value) { state.search.q = $('searchInput').value; applySearch(); } else stepHit(e.shiftKey ? -1 : 1); }
+  else if (e.key === 'Escape') { e.preventDefault(); closeSearch(); }
+});
+
+/** Risultati della ricerca in più lezioni: titolo, numero di risultati, i primi brani con il tempo. */
+function searchResultsHtml(results, q) {
+  if (fold(q.trim()).length < 2) return '';
+  if (!results.length) return `<p class="help">Nessun risultato per «${esc(q.trim())}».</p>`;
+  const total = results.reduce((n, r) => n + r.hits.length, 0);
+  return `<p class="help">${total} ${total === 1 ? 'risultato' : 'risultati'} in ${results.length} ${results.length === 1 ? 'lezione' : 'lezioni'}</p>` + results.map(({ job, hits }) => {
+    const long = (job.duration || 0) >= 3600;
+    const items = hits.slice(0, 5).map(h => {
+      const s = h.snippet;
+      return `<li><button type="button" class="sr-hit" data-id="${job.id}" data-i="${h.i}"><span class="sr-time">${fmtTime(h.t, long)}</span><span class="sr-snip">${h.pre ? '…' : ''}${esc(s.slice(0, h.off))}<mark>${esc(s.slice(h.off, h.off + h.len))}</mark>${esc(s.slice(h.off + h.len))}${h.post ? '…' : ''}</span></button></li>`;
+    }).join('');
+    const more = hits.length > 5 ? `<button type="button" class="quiet sr-hit sr-more" data-id="${job.id}" data-i="${hits[5].i}">altri ${hits.length - 5} nella lezione</button>` : '';
+    return `<div class="sr-lecture"><p class="sr-title">${esc(job.title)} <span>· ${hits.length}</span></p><ol>${items}</ol>${more}</div>`;
+  }).join('');
+}
+
+async function courseJobs(course) {
+  const by = j => j.recordedAt || j.createdAt || 0;
+  return (await store.listJobs()).filter(j => (j.course || '') === (course || '') && (j.chunks?.some(c => c.raw) || j.edited)).sort((a, b) => by(a) - by(b));
+}
+
+$('searchCourse').addEventListener('click', async () => {
+  const job = await store.getJob(state.jobId);
+  const q = $('searchInput').value;
+  if (!job || fold(q.trim()).length < 2) { toast('Scrivi almeno due lettere.'); return; }
+  const results = searchLectures(await courseJobs(job.course), q);
+  openSheet(`<p class="sheet-title">«${esc(q.trim())}» in ${job.course ? `«${esc(job.course)}»` : 'tutte le lezioni senza corso'}</p><div class="search-results sheet-results">${searchResultsHtml(results, q)}</div>`);
+});
+
+let courseSearchTimer;
+$('courseSearch').addEventListener('input', () => {
+  clearTimeout(courseSearchTimer);
+  courseSearchTimer = setTimeout(async () => {
+    const q = $('courseSearch').value;
+    $('courseSearchResults').innerHTML = searchResultsHtml(searchLectures(await courseJobs(state.courseName), q), q);
+  }, 250);
+});
+
+/** Da un risultato: apre la lezione, attiva la ricerca e porta al brano. */
+document.addEventListener('click', async e => {
+  const b = e.target.closest('.sr-hit');
+  if (!b) return;
+  const q = b.closest('#sheet') ? $('searchInput').value : $('courseSearch').value;
+  closeSheet();
+  if (state.jobId !== b.dataset.id || state.view !== 'lecture') await openLecture(b.dataset.id);
+  if (state.tab !== 'revised') { state.tab = 'revised'; state.userTab = true; await renderLecture(); }
+  openSearch(q, { para: Number(b.dataset.i) });
+});
+
+// ====================================================================
+// Indice della lezione (su richiesta, con un modello "lite": solo testo)
+// ====================================================================
+
+state.tocBusy = new Set();
+
+function renderToc(job) {
+  const box = $('lecToc');
+  const items = job.index?.items || [];
+  const busy = state.tocBusy.has(job.id);
+  box.hidden = (!items.length && !busy) || state.tab !== 'revised' || state.editing;
+  if (box.hidden) return;
+  if (busy) { box.innerHTML = '<p class="toc-busy">Creo l\'indice…</p>'; return; }
+  const long = (job.duration || 0) >= 3600;
+  box.innerHTML = `<details${state.tocClosed ? '' : ' open'}><summary>Indice <span>· ${items.length} argomenti</span></summary>
+    <ol>${items.map(it => `<li><button type="button" class="toc-item" data-t="${it.t}"><span class="toc-time">${fmtTime(it.t, long)}</span><span>${esc(it.title)}</span></button></li>`).join('')}</ol>
+    <button type="button" class="quiet toc-redo">Rigenera</button></details>`;
+  box.querySelector('details').addEventListener('toggle', e => { state.tocClosed = !e.target.open; });
+}
+
+async function buildIndex(id) {
+  const job = await store.getJob(id);
+  if (!job) return;
+  if (job.status !== 'done') { toast('L\'indice si può creare a elaborazione finita.'); return; }
+  if (!settings.apiKey) { toast('Manca la chiave API Gemini.'); return; }
+  state.tocBusy.add(id);
+  if (state.jobId === id) renderToc(job);
+  try {
+    const index = await makeIndex(job, settings);
+    await store.updateJob(id, j => { j.index = index; });
+    state.tocClosed = false;
+    sync.run();
+    toast(`Indice creato (${index.items.length} argomenti)`);
+  } catch (e) {
+    toast(e.status !== undefined ? explainError(e) : e.message);
+  } finally {
+    state.tocBusy.delete(id);
+    if (state.jobId === id) renderToc(await store.getJob(id));
+  }
+}
+
+$('lecToc').addEventListener('click', e => {
+  if (e.target.closest('.toc-redo')) { buildIndex(state.jobId); return; }
+  const it = e.target.closest('.toc-item');
+  if (!it) return;
+  const t = Number(it.dataset.t);
+  let k = 0;
+  state.paraTimes.forEach((pt, j) => { if (pt <= t + 0.5) k = j; });
+  const el = $('transcript').querySelector(`.para[data-i="${k}"]`);
+  el?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  el?.classList.remove('flash'); void el?.offsetWidth; el?.classList.add('flash');
+  state.tocAway = true;
+  setTimeout(() => { $('tocBack').hidden = !state.tocAway; }, 400);
+});
+$('tocBack').addEventListener('click', () => {
+  state.tocAway = false;
+  $('tocBack').hidden = true;
+  $('lecToc').scrollIntoView({ behavior: 'smooth', block: 'start' });
+});
+new IntersectionObserver(entries => {
+  if (entries.some(en => en.isIntersecting) && state.tocAway) { state.tocAway = false; $('tocBack').hidden = true; }
+}, { threshold: 0.3 }).observe($('lecToc'));
+
+// ====================================================================
+// Nuova revisione di tutto il testo, e versioni precedenti
+// ====================================================================
+
+/** Testo attuale della lezione (con le correzioni a mano), da conservare prima di sostituirlo. */
+const currentVersion = (j, label) => ({
+  at: Date.now(), label, partial: !!j.edited?.partial,
+  paragraphs: lectureParagraphs(j, 'revised').map(({ t, text }) => ({ t, text })),
+});
+
+async function startRedo(id, mode) {
+  if (!settings.apiKey) { toast('Manca la chiave API Gemini.'); return; }
+  await store.updateJob(id, j => {
+    j.prevVersions = [currentVersion(j, 'prima della nuova revisione'), ...(j.prevVersions || [])].slice(0, 2);
+    for (const c of j.chunks || []) {
+      if (typeof c.raw === 'string' && c.raw) { delete c.revised; delete c.paragraphs; delete c.warn; delete c.ratio; delete c.reviseEngine; }
+    }
+    delete j.edited;
+    delete j.notice;
+    j.redo = { mode, at: Date.now(), until: mode === 'strong' ? Date.now() + 30 * 60_000 : null };
+    j.status = 'queued'; j.error = null; j.runner = store.deviceId;
+  });
+  closeSearch();
+  renderLecture();
+  sync.run();
+  runQueue();
+}
+
+async function restoreVersion(id, k) {
+  await store.updateJob(id, j => {
+    const v = j.prevVersions?.[k];
+    if (!v) return;
+    const now = currentVersion(j, 'sostituita da un ripristino');
+    j.edited = { paragraphs: v.paragraphs.map(p => ({ ...p })), at: Date.now(), partial: v.partial !== false };
+    j.prevVersions = [now, ...j.prevVersions.filter((_, x) => x !== k)].slice(0, 2);
+    delete j.notice;
+  });
+  renderLecture();
+  sync.run();
+  toast('Versione ripristinata: quella che c\'era prima resta nei Dettagli');
+}
+
+// ====================================================================
+// Dettagli dell'elaborazione (registro e riepilogo, anche a lavoro finito)
+// ====================================================================
+
+function showDetails(job, from) {
+  const long = (job.duration || 0) >= 3600;
+  const when = t => new Date(t).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
+  const day = t => new Date(t).toLocaleDateString('it-IT', { day: 'numeric', month: 'long' });
+  const mins = (a, b) => Math.max(1, Math.round((b - a) / 60000));
+  const rows = [];
+  if (job.duration) rows.push(`Audio di ${fmtTime(job.duration, long)}, ${job.chunks?.length || 0} ${job.chunks?.length === 1 ? 'blocco' : 'blocchi'}`);
+  if (job.startedAt && job.finishedAt) rows.push(`Elaborata il ${day(job.startedAt)}, dalle ${when(job.startedAt)} alle ${when(job.finishedAt)} (${mins(job.startedAt, job.finishedAt)} min, comprese eventuali attese)`);
+  const blocks = (job.chunks || []).map((c, i) => `<li>Blocco ${i + 1} (${fmtTime(c.start, long)}–${fmtTime(c.end, long)}): ${c.engine ? `trascritto con ${esc(c.engine)}` : 'non ancora trascritto'}${c.reviseEngine ? `, rivisto con ${esc(c.reviseEngine)}` : ''}</li>`).join('');
+  if (job.index?.model) rows.push(`Indice creato con ${esc(job.index.model)}`);
+  if (job.edited) rows.push(job.edited.partial ? 'Contiene correzioni a mano su singoli paragrafi' : 'Testo modificato a mano');
+  const log = (job.log || []).join('\n');
+  openSheet(`<p class="sheet-title">Dettagli: ${esc(job.title)}</p>
+    <div class="details">
+      ${rows.map(r => `<p>${r}</p>`).join('')}
+      ${blocks ? `<ul>${blocks}</ul>` : ''}
+      ${(job.prevVersions || []).length ? `<p class="details-log-title">Versioni precedenti del testo</p>${job.prevVersions.map((v, k) => `<p class="version-row"><span>${day(v.at)}, ${when(v.at)}: ${esc(v.label || '')}</span><button type="button" class="quiet" data-restore="${k}">Ripristina</button></p>`).join('')}` : ''}
+      <p class="details-log-title">Registro (${job.log?.length || 0} righe)</p>
+      <pre class="details-log">${esc(log) || 'Nessuna riga.'}</pre>
+    </div>
+    <button type="button" class="sheet-item" data-close>Chiudi</button>`, { id: job.id });
 }
 
 $('lecChecks').addEventListener('click', e => {
@@ -1288,6 +1691,26 @@ async function lectureAction(act, id, from = 'menu') {
     }
     case 'copy':
       try { await navigator.clipboard.writeText(md); toast('Testo copiato'); } catch { toast('Copia non riuscita'); }
+      break;
+    case 'index':
+      if (state.jobId !== id || state.view !== 'lecture') await openLecture(id);
+      if (job.index?.items?.length) { state.tocClosed = false; renderToc(job); $('lecToc').scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+      else await buildIndex(id);
+      break;
+    case 'details':
+      showDetails(job, from);
+      break;
+    case 'redo':
+      if (job.status !== 'done') { toast('Si può rivedere di nuovo a elaborazione finita.'); break; }
+      openSheet(`<p class="sheet-title">Rivedi di nuovo tutto il testo</p>
+        <div class="sheet-form">
+          <p class="help">Gemini rivede di nuovo ogni blocco riascoltando l'audio, partendo dalla trascrizione grezza. Il testo attuale, con le tue correzioni a mano, resta salvato: lo ripristini da <b>Dettagli</b>.</p>
+          <label for="redoMode">Modelli</label>
+          ${modeSelect('redoMode')}
+          <p class="help">"Solo 3.8 e 3.7" aspetta che uno dei due sia libero; se dopo 30 minuti non lo è, si ferma e lascia il testo com'era.</p>
+        </div>
+        <button type="button" class="sheet-item" data-redo-go>Avvia la nuova revisione</button>
+        <button type="button" class="sheet-item" data-close>Annulla</button>`, { id });
       break;
     case 'save': {
       const handle = await folderFor(job);
@@ -1397,7 +1820,9 @@ async function openLectureMenu(id, pos = {}) {
     ...(canResume ? [['resume', 'Riprendi elaborazione']] : []),
     ['rename', 'Rinomina'],
     ['move', 'Sposta in un altro corso'],
-    ...(hasText ? [['edit', 'Modifica testo'], ['copy', 'Copia testo'], ['save', 'Salva .md'], ...(navigator.share ? [['share', 'Condividi']] : [])] : []),
+    ...(hasText ? [['edit', 'Modifica testo'], ...(job.status === 'done' ? [['index', job.index ? 'Indice' : 'Crea indice']] : []), ['copy', 'Copia testo'], ['save', 'Salva .md'], ...(navigator.share ? [['share', 'Condividi']] : [])] : []),
+    ...(job.status === 'done' && hasText ? [['redo', 'Rivedi di nuovo tutto il testo']] : []),
+    ['details', 'Dettagli elaborazione'],
     ...(job.remote?.mdId || job.remote?.audioId ? [['drive', 'Apri su Drive']] : []),
     ['delete', 'Elimina'],
   ];
@@ -1416,6 +1841,19 @@ $('sheet').addEventListener('click', async e => {
   if (mv) {
     closeSheet();
     await moveLecture(id, mv.dataset.move);
+    return;
+  }
+  if (e.target.closest('[data-redo-go]')) {
+    const mode = $('redoMode').value;
+    store.device.set('reviewMode', mode);
+    closeSheet();
+    await startRedo(id, mode);
+    return;
+  }
+  const rs = e.target.closest('[data-restore]');
+  if (rs) {
+    closeSheet();
+    await restoreVersion(id, Number(rs.dataset.restore));
     return;
   }
   const b = e.target.closest('[data-act]');
@@ -1515,6 +1953,7 @@ document.addEventListener('keydown', e => {
   else if (e.key === ']') player.cycleRate(1);
   else if (e.key === '[') player.cycleRate(-1);
   else if (e.key === 'n' || e.key === 'N') { e.preventDefault(); stepPoint(e.shiftKey ? -1 : 1); }
+  else if (e.key === '/') { e.preventDefault(); openSearch(); }
   else if (e.key === 'Escape' && state.qpop) closePoint();
 });
 

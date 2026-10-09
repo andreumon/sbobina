@@ -105,6 +105,7 @@ export function recordGroq(sec) {
 // ---------------------------------------------------------------- Dal risultato al testo grezzo
 
 // Frasi che Whisper "inventa" nei silenzi (imparate dai sottotitoli dei video).
+const SHORT_PHANTOM = /^(?:grazie(?: a tutti| mille| per l'attenzione)?|ciao(?: a tutti)?|buonanotte|thank you(?: very much)?|thanks|bye)[\s.!…]*$/i;
 const PHANTOM = /^(?:sottotitoli (?:creati|a cura|e revisione)|.*amara\.org|grazie (?:a tutti )?per (?:la visione|aver guardato)|iscriviti al canale|thanks? for watching|subtitles by|please subscribe|ciao a tutti e benvenuti sul mio canale)/i;
 
 /**
@@ -117,20 +118,25 @@ export function rawFromSegments(segments) {
   const droppedItems = [];
   let prev = '';
   let repeats = 0;
-  for (const s of segments || []) {
+  const segs = (segments || []).filter(s => String(s.text || '').trim());
+  segs.forEach((s, k) => {
     const text = String(s.text || '').trim();
-    if (!text) continue;
     const silent = (s.no_speech_prob ?? 0) > 0.6 && (s.avg_logprob ?? 0) < -0.9;
     const looping = (s.compression_ratio ?? 0) > 2.6;
     const phantom = PHANTOM.test(text) && ((s.no_speech_prob ?? 0) > 0.2 || text.length < 60);
+    // "Grazie.", "Ciao." e simili da soli, in mezzo a un silenzio (pausa lunga prima e dopo):
+    // nelle lezioni sono quasi sempre inventati da Whisper.
+    const gapBefore = k ? (Number(s.start) || 0) - (Number(segs[k - 1].end) || 0) : Infinity;
+    const gapAfter = k < segs.length - 1 ? (Number(segs[k + 1].start) || 0) - (Number(s.end) || 0) : Infinity;
+    const lonely = SHORT_PHANTOM.test(text) && ((gapBefore >= 2 && gapAfter >= 2) || (s.no_speech_prob ?? 0) > 0.3);
     repeats = text.toLowerCase() === prev ? repeats + 1 : 0;
     prev = text.toLowerCase();
-    if (silent || looping || phantom || repeats >= 2) {
-      droppedItems.push({ start: Number(s.start) || 0, text, why: phantom ? 'frase tipica dei sottotitoli' : looping ? 'ripetizione in loop' : repeats >= 2 ? 'ripetuta' : 'silenzio' });
-      continue;
+    if (silent || looping || phantom || lonely || repeats >= 2) {
+      droppedItems.push({ start: Number(s.start) || 0, text, why: phantom ? 'frase tipica dei sottotitoli' : lonely ? 'frase breve isolata nel silenzio' : looping ? 'ripetizione in loop' : repeats >= 2 ? 'ripetuta' : 'silenzio' });
+      return;
     }
     kept.push({ start: Number(s.start) || 0, end: Number(s.end) || 0, text });
-  }
+  });
   // Paragrafi: si va a capo dopo una pausa lunga, dopo una pausa breve se il paragrafo è già
   // abbastanza lungo, o comunque dopo ~900 caratteri (così i tempi restano fitti).
   const paras = [];

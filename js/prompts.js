@@ -61,6 +61,7 @@ export function revisionPrompt({ raw, course, glossary, index, total, start, end
     lines.push(range
       ? `9. Inizia OGNI paragrafo con il tempo in cui comincia, tra parentesi quadre in formato [MM:SS], misurato dall'inizio della registrazione completa (quindi tra ${fmtMMSS(range[0])} e ${fmtMMSS(range[1])}). I tempi devono essere crescenti.`
       : `9. Inizia OGNI paragrafo con il tempo in cui comincia nell'audio di questo segmento, tra parentesi quadre in formato [MM:SS], misurato dall'inizio del segmento (quindi tra [00:00] e [${lenLabel}]; oltre l'ora i minuti continuano: [61:30]). I tempi devono essere crescenti.`);
+    if (timedRaw && withAudio) lines.push('   La trascrizione grezza viene da un riconoscimento automatico che a volte inventa brevi frasi nei silenzi (per esempio «Grazie.», «Grazie per la visione!», «Sottotitoli a cura di…»): se nell\'audio non le senti, eliminale.');
     if (timedRaw) lines.push('   La trascrizione grezza ha già, all\'inizio di ogni pezzo, il tempo [MM:SS] misurato con precisione dall\'inizio del segmento: usalo come riferimento. Un tuo paragrafo inizia al tempo del pezzo grezzo in cui comincia (o poco dopo, se comincia a metà pezzo). Non copiare i tempi grezzi dentro il testo.');
   }
   if (glossary) lines.push('', `Termini tecnici del corso che possono comparire: ${glossary}.`);
