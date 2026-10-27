@@ -18,7 +18,7 @@ Tutto gratuito: usa il piano gratuito della Gemini API e il tuo Google Drive.
 
 Se chiudi l'app o cade la rete, l'elaborazione riparte dal blocco in cui si era fermata.
 
-**Revisione in background**: la revisione (e la trascrizione con Gemini) si chiede a Google in *modalità background*. Google risponde subito con un numero di pratica e lavora per conto suo; l'app chiede ogni pochi secondi se il risultato è pronto. Se lo schermo si spegne, apri un'altra app o la rete va e viene, il lavoro non si perde: alla domanda successiva il risultato c'è. Il numero di pratica resta salvato nella lezione, quindi anche chiudendo l'app la revisione si recupera alla riapertura (entro 6 ore) invece di ripartire da capo. Se Google non accetta la modalità background, Sbobina lo scrive nel registro e usa la richiesta normale.
+**Nota (v18)**: la *modalità background* di Google, provata nella v17, non si usa: Google gira quelle richieste a una variante "-agent" del modello che non accetta l'audio. Con il telefono in tasca la revisione può quindi ancora perdersi se cade la rete; l'app la richiede da sola.
 
 ## Installazione (una volta sola, circa 20 minuti)
 

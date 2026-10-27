@@ -33,8 +33,11 @@ class RedoExpired extends Error {}
 const GEN_CONFIG = { maxOutputTokens: 32768, thinkingLevel: 'low' };
 const MAX_INLINE_WAIT = 6 * 60_000;        // oltre questa attesa la lezione va "in attesa" e libera la coda
 const SWITCH_IF_WAIT = 2 * 60_000;         // se un modello va atteso più di così, si preferisce un altro libero
-const KEY_OFFLINE_PAUSE = 2 * 60_000;
-const PENDING_MAX_MS = 6 * 3600_000;         // una revisione in background si riprende entro 6 ore      // una chiave che non risponde (rete) si salta per 2 minuti
+const KEY_OFFLINE_PAUSE = 2 * 60_000;      // una chiave che non risponde (rete) si salta per 2 minuti
+// Revisione in background: disattivata dalla v18. Con background: true Google gira la richiesta a una
+// variante "-agent" del modello che non accetta audio. Resta solo la ripresa di eventuali richieste
+// rimaste in sospeso dalla v17.
+const PENDING_MAX_MS = 6 * 3600_000;
 
 /** Nessun modello disponibile adesso: la lezione si rimette in coda all'ora indicata. */
 export class BusyError extends Error {
@@ -513,7 +516,7 @@ async function runJob(id, ctx) {
               if (c.kind === 'transcribe') {
                 return withLightFallback(async () => c.key.gemini.transcribe({ model: c.model, audio: await audioFor(i, strategy.transcribe, c.key), language: lang.codes, vocabulary: strategy.transcribe.vocab ? vocabulary : [], maxOutputTokens: 32768, overloadRetries: 0 }));
               }
-              return withLightFallback(async () => c.key.gemini.generate({ model: c.model, audio: await audioFor(i, strategy.revise, c.key), endpoint: strategy.revise.endpoint, label: 'Trascrizione', config: GEN_CONFIG, overloadRetries: 0, background: true,
+              return withLightFallback(async () => c.key.gemini.generate({ model: c.model, audio: await audioFor(i, strategy.revise, c.key), endpoint: strategy.revise.endpoint, label: 'Trascrizione', config: GEN_CONFIG, overloadRetries: 0,
                 prompt: transcriptionPrompt({ course: job.course, glossary: glossaryText, range, lang }) }));
             },
           }));
@@ -574,7 +577,6 @@ async function runJob(id, ctx) {
             try {
               return await withLightFallback(async () => c.key.gemini.generate({ model: c.model, prompt, endpoint: strategy.revise.endpoint, label: 'Revisione', config: GEN_CONFIG, overloadRetries: 0,
                 audio: withAudio ? await audioFor(i, strategy.revise, c.key) : null,
-                background: true,
                 onStarted: async id => { job = await patch(j => { j.chunks[i].pendingRev = { id, model: c.model, keyTag: c.key.tag, at: Date.now(), raw: chunk.raw.length }; }); },
               }));
             } finally {

@@ -324,7 +324,9 @@ export class Gemini {
       try {
         return await this.interact(body, label, rest);
       } catch (e) {
-        if (bg && e.status === 400 && /background/i.test(e.message)) {
+        // Rifiuto della modalità background. In pratica Google la gira a una variante "-agent" del modello
+        // che non accetta l'audio ("Audio input modality is not enabled for models/…-agent").
+        if (bg && e.status === 400 && /background|-agent\b|modality is not enabled/i.test(e.message)) {
           // Google non accetta la modalità in background (per esempio nel piano gratuito): richiesta normale.
           backgroundRejected = true;
           this.log(`${label}: Google non accetta la richiesta in background (${e.message}), uso quella normale`);
