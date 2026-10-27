@@ -242,28 +242,143 @@ export function wordDiff(a, b) {
 export const foldChar = c => (c.normalize('NFD')[0] || c).toLowerCase().charAt(0);
 export const fold = s => Array.from(String(s), foldChar).join('');
 
+// Ricerca elastica: oltre alla frase esatta trova
+//  - le stesse parole in qualsiasi ordine, vicine tra loro (entro qualche parola);
+//  - forme diverse della stessa parola (condizionata, condizionate, condizionale…);
+//  - errori di battitura o di trascrizione (aleatorai → aleatoria, Leskovek → Leskovec).
+// I risultati esatti vengono sempre prima di quelli "simili".
+
+const STOP = new Set(('di a da in con su per tra fra il lo la i gli le l un uno una un e ed o od che chi cui del dello della dei degli delle ' +
+  'al allo alla ai agli alle dal dallo dalla dai dagli dalle nel nello nella nei negli nelle sul sullo sulla sui sugli sulle ' +
+  'col coi se si non ne ci vi c è e\' come anche ma piu più the of and to is').split(' ').map(w => fold(w)));
+// Desinenze italiane comuni, dalla più lunga: si tolgono per confrontare le "radici" delle parole.
+const SUFFIXES = ['amente', 'azioni', 'azione', 'mente', 'zioni', 'zione', 'menti', 'mento', 'ando', 'endo', 'ante', 'enti', 'ente',
+  'ato', 'ata', 'ati', 'ate', 'ito', 'ita', 'iti', 'ite', 'uto', 'uta', 'uti', 'ute', 'are', 'ere', 'ire', 'ale', 'ali',
+  'ico', 'ica', 'ici', 'iche', 'ore', 'ori', 'oni', 'one', 'ezza', 'a', 'e', 'i', 'o'];
+export function stem(w) {
+  for (const suf of SUFFIXES) if (w.length - suf.length >= 4 && w.endsWith(suf)) return w.slice(0, -suf.length);
+  return w;
+}
+/** Distanza di modifica (con scambio di lettere vicine), interrotta appena supera max. */
+function editDistance(a, b, max) {
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev2 = null, prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    let best = i;
+    for (let j = 1; j <= b.length; j++) {
+      let v = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      if (prev2 && i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) v = Math.min(v, prev2[j - 2] + 1);
+      cur.push(v);
+      if (v < best) best = v;
+    }
+    if (best > max) return max + 1;
+    prev2 = prev; prev = cur;
+  }
+  return prev[b.length];
+}
+const typos = len => (len >= 8 ? 2 : len >= 4 ? 1 : 0);
+/** Quanto una parola del testo somiglia a una della ricerca: 3 uguale, 2 stessa radice o inizio, 1 errore di battitura, 0 no. */
+function wordScore(q, t) {
+  if (q === t) return 3;
+  if (q.length < 3) return 0;
+  const sq = stem(q), stt = stem(t);
+  if (sq.length >= 4 && sq === stt) return 2;
+  if (q.length >= 4 && t.startsWith(q)) return 2; // parola scritta a metà
+  const k = typos(q.length);
+  if (k && (editDistance(q, t, k) <= k || (sq.length >= 4 && editDistance(sq, stt, k) <= k))) return 1;
+  return 0;
+}
+const WORD = /[\p{L}\p{N}]+/gu;
+
+/** Prepara una ricerca: parole significative e cache dei confronti. */
+export function makeQuery(q) {
+  const fq = fold(String(q || '').trim());
+  const all = [...fq.matchAll(WORD)].map(m => m[0]);
+  const words = all.length > 1 && all.some(w => !STOP.has(w)) ? all.filter(w => !STOP.has(w)) : all;
+  return { fq, words: [...new Set(words)], cache: new Map() };
+}
+
 /**
- * Cerca q nei paragrafi rivisti delle lezioni date.
- * @returns {{job, hits: {t:number, i:number, snippet:string}[]}[]} solo le lezioni con risultati
+ * Corrispondenze in un testo.
+ * @returns {{spans: [number, number][], exact: boolean, score: number}[]} intervalli (indici della stringa originale),
+ *   prima gli esatti poi i simili, ciascun gruppo in ordine di testo
+ */
+export function matchText(text, query) {
+  const Q = typeof query === 'string' ? makeQuery(query) : query;
+  if (Q.fq.length < 2) return [];
+  // Indici: il testo "piegato" (minuscole, senza accenti) ha un carattere per ogni carattere visibile
+  const chars = Array.from(String(text));
+  const map = []; let pos = 0;
+  for (const ch of chars) { map.push(pos); pos += ch.length; }
+  map.push(pos);
+  const ft = chars.map(foldChar).join('');
+  const exact = [];
+  for (let k = ft.indexOf(Q.fq); k >= 0; k = ft.indexOf(Q.fq, k + Q.fq.length)) exact.push({ spans: [[map[k], map[k + Q.fq.length]]], exact: true, score: 100 });
+  if (!Q.words.length) return exact;
+  const taken = (a, b) => exact.some(g => g.spans.some(([x, y]) => a < y && b > x));
+
+  // Parole del testo e, per ognuna, a quali parole della ricerca somiglia
+  const tw = [...ft.matchAll(WORD)].map(m => ({ a: m.index, b: m.index + m[0].length, w: m[0] }));
+  const scoreOf = (qi, w) => {
+    const key = `${qi}\u0000${w}`;
+    let v = Q.cache.get(key);
+    if (v === undefined) { v = wordScore(Q.words[qi], w); Q.cache.set(key, v); }
+    return v;
+  };
+  const fuzzy = [];
+  const nq = Q.words.length;
+  const W = Math.max(8, nq * 4); // le parole devono stare entro W parole l'una dall'altra
+  for (let i = 0; i < tw.length; i++) {
+    const firstHit = Q.words.some((_, qi) => scoreOf(qi, tw[i].w));
+    if (!firstHit) continue;
+    // Finestra che parte da questa parola: per ogni parola cercata, la migliore somiglianza
+    const best = new Array(nq).fill(null);
+    let end = i;
+    for (let j = i; j < Math.min(tw.length, i + W); j++) {
+      for (let qi = 0; qi < nq; qi++) {
+        const sc = scoreOf(qi, tw[j].w);
+        if (sc && (!best[qi] || sc > best[qi].sc)) best[qi] = { sc, j };
+      }
+      if (best.every(Boolean)) { end = j; break; }
+    }
+    if (!best.every(Boolean)) continue;
+    const idx = [...new Set(best.map(b => b.j))].sort((x, y) => x - y);
+    if (idx.length < Math.min(nq, 1)) continue;
+    const spans = idx.map(j => [map[tw[j].a], map[tw[j].b]]);
+    const score = best.reduce((n, b) => n + b.sc, 0) - (end - i) * 0.1;
+    // Uguale alla frase esatta (già trovata) o solo parole identiche nello stesso posto: non è un "simile" in più
+    if (spans.every(([a, b]) => taken(a, b))) { i = end; continue; }
+    fuzzy.push({ spans, exact: false, score });
+    i = end; // niente gruppi sovrapposti
+  }
+  return [...exact, ...fuzzy];
+}
+
+/**
+ * Cerca q nei paragrafi rivisti delle lezioni date (ricerca elastica, esatti prima).
+ * @returns {{job, hits: {t:number, i:number, snippet:string, marks:[number,number][], exact:boolean}[]}[]} solo le lezioni con risultati
  */
 export function searchLectures(jobs, q) {
-  const fq = fold(q.trim());
-  if (fq.length < 2) return [];
+  const Q = makeQuery(q);
+  if (Q.fq.length < 2) return [];
   const out = [];
   for (const job of jobs) {
     let last = 0;
-    const hits = [];
+    const exactHits = [], fuzzyHits = [];
     lectureParagraphs(job, 'revised').forEach((p, i) => {
       last = p.t ?? last;
-      const ft = fold(p.text);
-      let k = ft.indexOf(fq);
-      while (k >= 0) {
-        const s = Math.max(0, k - 50), e = Math.min(p.text.length, k + fq.length + 50);
-        hits.push({ t: last, i, at: k, len: fq.length, snippet: p.text.slice(s, e), pre: s > 0, post: e < p.text.length, off: k - s });
-        k = ft.indexOf(fq, k + fq.length);
+      for (const g of matchText(p.text, Q)) {
+        const a = g.spans[0][0], b = g.spans.at(-1)[1];
+        const s = Math.max(0, a - 50), e = Math.min(p.text.length, b + 50);
+        const hit = { t: last, i, at: a, len: b - a, snippet: p.text.slice(s, e), pre: s > 0, post: e < p.text.length,
+          off: a - s, marks: g.spans.map(([x, y]) => [x - s, y - s]), exact: g.exact };
+        (g.exact ? exactHits : fuzzyHits).push(hit);
       }
     });
-    if (hits.length) out.push({ job, hits });
+    const hits = [...exactHits, ...fuzzyHits];
+    if (hits.length) out.push({ job, hits, exact: exactHits.length });
   }
-  return out;
+  // Prima le lezioni con risultati esatti (nell'ordine dato), poi quelle con soli risultati simili
+  return [...out.filter(r => r.exact), ...out.filter(r => !r.exact)];
 }

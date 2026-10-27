@@ -18,7 +18,12 @@ export const getJob = id => db.get('jobs', id);
 
 export async function listJobs() {
   const jobs = await db.all('jobs');
-  return jobs.sort((a, b) => ((b.recordedAt || b.createdAt) - (a.recordedAt || a.createdAt)) || (b.createdAt - a.createdAt));
+  // Ordine: prima le lezioni senza posizione scelta a mano (le nuove), dalla più recente;
+  // poi quelle riordinate a mano, secondo la posizione (rank 0 = in cima). Il rank vale dentro il corso.
+  const hasRank = j => typeof j.rank === 'number';
+  return jobs.sort((a, b) => (hasRank(a) - hasRank(b))
+    || (hasRank(a) && a.rank - b.rank)
+    || ((b.recordedAt || b.createdAt) - (a.recordedAt || a.createdAt)) || (b.createdAt - a.createdAt));
 }
 
 export async function putJob(job, { touch = true } = {}) {

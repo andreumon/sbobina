@@ -256,3 +256,29 @@ export function coverageWarnings(paragraphs, start, end, lectureDuration = end, 
   if (unsure.length) out.push(`Possibili parti non trascritte: ${list(unsure)}. Potrebbero essere pause o silenzi: ascolta per verificare.`);
   return out;
 }
+
+/**
+ * Data in fondo al nome del file, nel formato "MATERIA_TITOLO GG_MM" (accetta anche GG-MM, GG.MM, GG/MM
+ * e l'underscore al posto dello spazio). L'anno è quello che rende la data la più recente non nel futuro.
+ * @returns {{ title: string, date: number|null }} titolo senza estensione né data (underscore → spazi);
+ *   date = mezzogiorno del giorno trovato (ms) o null
+ */
+export function dateFromName(name, now = Date.now()) {
+  const base = String(name || '').replace(/\.[a-z0-9]{1,5}$/i, '');
+  const m = /(?:^|[\s_]+)(\d{1,2})[\s_.\-/](\d{1,2})\s*$/.exec(base);
+  const clean = s => s.replace(/[_]+/g, ' ').replace(/\s+/g, ' ').replace(/[\s\-–]+$/, '').trim();
+  if (!m) return { title: clean(base), date: null };
+  const day = Number(m[1]), month = Number(m[2]);
+  const today = new Date(now);
+  const at = y => {
+    const d = new Date(y, month - 1, day, 12, 0, 0);
+    return d.getMonth() === month - 1 && d.getDate() === day ? d : null; // scarta 31_11 e simili
+  };
+  let d = at(today.getFullYear());
+  if (!d) d = at(today.getFullYear() - 1); // 29_02 in un anno non bisestile
+  if (!d) return { title: clean(base), date: null };
+  const endOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59).getTime();
+  for (let y = d.getFullYear() - 1; d.getTime() > endOfToday && y >= today.getFullYear() - 8; y--) d = at(y) || d;
+  if (d.getTime() > endOfToday) return { title: clean(base), date: null };
+  return { title: clean(base.slice(0, m.index)) || clean(base), date: d.getTime() };
+}

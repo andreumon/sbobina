@@ -8,7 +8,7 @@ Tutto gratuito: usa il piano gratuito della Gemini API e il tuo Google Drive.
 
 1. **Condividi** il file `.aac` dal Registratore e scegli *Sbobina*.
 2. L'app taglia la lezione in **blocchi di circa 20 minuti**. Intorno a ogni punto di taglio cerca la pausa più silenziosa, così una parola non viene spezzata a metà. L'AAC del registratore è fatto di frame indipendenti: il taglio avviene senza ricodificare nulla. Le lezioni lunghe vanno bene, anche 3 o 4 ore.
-3. Ogni blocco viene trascritto parola per parola. Se hai inserito una chiave Groq lo fa **Whisper large-v3** su Groq, che restituisce anche il tempo preciso di ogni frase; altrimenti (o se Groq non risponde) `gemini-3.5-transcribe`, il modello di Google dedicato alla trascrizione. A entrambi passiamo la lingua del corso e i suoi termini tecnici.
+3. Ogni blocco viene trascritto parola per parola. Se hai inserito una chiave Groq lo fa **Whisper large-v3** su Groq, che restituisce anche il tempo preciso di ogni frase; altrimenti (o se Groq non risponde) gli stessi modelli flash della revisione, in ordine di priorità. (`gemini-3.5-transcribe` non si usa più: nel piano gratuito accetta 10.000 token al minuto, e un blocco di 45 minuti ne vale circa 86.000.) A entrambi passiamo la lingua del corso e i suoi termini tecnici.
    Prima dell'invio il blocco viene convertito in **Opus mono a 16 kHz** (*invii leggeri*): 45 minuti passano da circa 65 MB a circa 8 MB, con la stessa resa per il riconoscimento del parlato (i modelli lavorano comunque a 16 kHz mono).
 4. `gemini-3.8-flash` **rivede** il testo riascoltando l'audio. Aggiunge punteggiatura e paragrafi e corregge le parole storpiate in base al contesto. Mette `[?]` sulle correzioni incerte e `[incomprensibile]` dove non si capisce. Aggiunge il tempo d'inizio di ogni paragrafo e scrive le formule in LaTeX.
 5. **Controllo di completezza**: Sbobina confronta il numero di parole della revisione con la trascrizione grezza. Se la revisione ne ha molte meno, il modello potrebbe aver riassunto invece di trascrivere, e l'app te lo segnala. La versione grezza resta sempre disponibile nella scheda *Grezza*.
@@ -17,6 +17,8 @@ Tutto gratuito: usa il piano gratuito della Gemini API e il tuo Google Drive.
 **Nota sul registratore Nothing**: i suoi file `.aac` iniziano con un "frame" finto da 9 byte, che contiene la configurazione del codec invece di audio. Google e il browser si bloccano su quel frame. Sbobina lo riconosce e lo esclude prima dell'invio; il file originale su Drive resta intatto.
 
 Se chiudi l'app o cade la rete, l'elaborazione riparte dal blocco in cui si era fermata.
+
+**Revisione in background**: la revisione (e la trascrizione con Gemini) si chiede a Google in *modalità background*. Google risponde subito con un numero di pratica e lavora per conto suo; l'app chiede ogni pochi secondi se il risultato è pronto. Se lo schermo si spegne, apri un'altra app o la rete va e viene, il lavoro non si perde: alla domanda successiva il risultato c'è. Il numero di pratica resta salvato nella lezione, quindi anche chiudendo l'app la revisione si recupera alla riapertura (entro 6 ore) invece di ripartire da capo. Se Google non accetta la modalità background, Sbobina lo scrive nel registro e usa la richiesta normale.
 
 ## Installazione (una volta sola, circa 20 minuti)
 
@@ -93,7 +95,10 @@ Serve perché il tuo sito possa leggere e scrivere i file di Sbobina nel tuo Dri
   - `[` / `]`: velocità.
   - `N` / `Maiusc+N`: punto da verificare successivo o precedente; `Esc` chiude il fumetto.
 - **Sul telefono** il lettore si controlla anche dalla schermata di blocco.
-- **Menu della lezione**: sul telefono tieni premuta una lezione nell'elenco; sul PC tasto destro, oppure il pulsante ⋯ che compare passandoci sopra. Trovi Apri, Rinomina, Sposta, Modifica, Copia, Salva .md, Condividi, Elimina e, se serve, Riprendi.
+- **Schermo acceso**: mentre elabora, Sbobina tiene acceso lo schermo finché l'app è aperta in primo piano. Si può disattivare in *Impostazioni → Trascrizione* (vale per quel dispositivo).
+- **Menu della lezione**: sul telefono tieni premuta una lezione nell'elenco; sul PC tasto destro, oppure il pulsante ⋯ che compare passandoci sopra. Trovi Apri, Rinomina, Cambia data, Sposta, Riordina, Modifica, Copia, Salva .md, Condividi, Elimina e, se serve, Riprendi.
+- **Data della lezione**: chiama la registrazione `MATERIA_TITOLO GG_MM` (per esempio `PROB_VAR-AL-NOTEVOLI 20_10`) e Sbobina prende la data dal nome e la toglie dal titolo. Vanno bene anche `20-10`, `20.10` e l'underscore al posto dello spazio; l'anno è quello che rende la data la più recente non nel futuro. Se nel nome la data non c'è, il campo data è evidenziato: la condivisione dal Registratore non trasmette la data vera del file. *Cambia data* nel menu la corregge dopo.
+- **Riordinare le lezioni di un corso**: *Riordina* nel menu, poi trascina la maniglia ≡ (sul PC anche con le frecce ↑ ↓ sulla maniglia); *Fine* chiude. L'ordine vale su tutti i dispositivi. Le lezioni nuove vanno in cima.
 - **Google sovraccarico**: se il modello di revisione è sovraccarico, Sbobina passa da solo al successivo in ordine di priorità: gemini-3.8-flash → 3.7-flash → 3.6-flash → 3.5-flash. I modelli migliori hanno sempre la precedenza; 3.6 e 3.5 si usano solo quando gli altri non sono disponibili, e *Dettagli* dice quale modello ha rivisto ogni blocco. I modelli "lite" non toccano mai il testo: servono solo per l'indice. Se sono tutti sovraccarichi o senza quota, la lezione va *in attesa* e riprova da sola.
 - **Punti da verificare**: la nuvoletta *N punti da verificare* accanto alle schede ti segue quando scorri (resta sopra il lettore). Ogni tocco apre il punto successivo:
   - il testo incerto è evidenziato e sotto compare un **fumetto**;
@@ -106,7 +111,7 @@ Serve perché il tuo sito possa leggere e scrivere i file di Sbobina nel tuo Dri
 - **Correggere tutto il testo**: *Modifica* nel menu apre l'intero testo con i tempi. La versione automatica resta recuperabile.
 - **Rivedere di nuovo tutto il testo**: *Rivedi tutto* tra le azioni della lezione rifà la revisione di ogni blocco, riascoltando l'audio e partendo dal grezzo, con la stessa scelta di modelli. Con *solo 3.8 e 3.7* la lezione aspetta che uno dei due sia libero; se dopo 30 minuti non lo è, si ferma e il testo resta quello di prima. Il testo che c'era prima, con le tue correzioni a mano, resta salvato: in *Dettagli → Versioni precedenti* lo ripristini con un tocco (si tengono le ultime due).
 - **Far rivedere un paragrafo a Gemini**: nell'editor del paragrafo, *Fai rivedere a Gemini questo paragrafo* manda solo il tratto di audio di quel paragrafo, il suo grezzo e i paragrafi vicini come contesto. Accanto scegli i modelli: *migliori disponibili* (3.8 → 3.5) oppure *solo 3.8 e 3.7*, che se sono occupati aspetta e riprova per al massimo 30 minuti (*Annulla* per smettere). L'app ricorda l'ultima scelta. La nuova versione compare sotto, con le parole aggiunte evidenziate e quelle tolte barrate: *Accetta*, *Modifica* o *Tieni la vecchia*.
-- **Cercare**: la lente accanto alle schede cerca nella lezione aperta, senza distinguere maiuscole e accenti; ‹ › (o `Invio` / `Maiusc+Invio`) passano da un risultato all'altro, su PC `/` apre la ricerca. *Cerca in tutto il corso* elenca le altre lezioni del corso con i minuti in cui compare il termine; un tocco apre la lezione in quel punto. Lo stesso campo di ricerca c'è in cima alla pagina del corso.
+- **Cercare**: la lente accanto alle schede cerca nella lezione aperta, senza distinguere maiuscole e accenti. Oltre alla frase esatta trova i risultati *simili*: le stesse parole in un altro ordine o con qualche parola in mezzo, altre forme della stessa parola (*condizionata* trova anche *condizionate*, *condizionale*) e gli errori di battitura o di trascrizione (*Leskovek* trova *Leskovec*). Gli esatti vengono prima e sono evidenziati pieni, i simili sono sottolineati e il contatore dice *simile*; ‹ › (o `Invio` / `Maiusc+Invio`) passano da un risultato all'altro, su PC `/` apre la ricerca. *Cerca in tutto il corso* elenca le altre lezioni del corso con i minuti in cui compare il termine; un tocco apre la lezione in quel punto. Lo stesso campo di ricerca c'è in cima alla pagina del corso.
 - **Indice**: *Indice* tra le azioni della lezione crea, su richiesta, l'elenco degli argomenti con i minuti di inizio (con gemini-flash-lite, che ha quote proprie e non consuma quelle delle revisioni). Toccando una voce si salta a quel punto, e la nuvoletta *↑ Indice* riporta su. *Rigenera* lo rifà.
 - **Dettagli**: *Dettagli* tra le azioni della lezione mostra, anche a lavoro finito, quali modelli hanno trascritto e rivisto ogni blocco, quanto è durata l'elaborazione e il registro completo.
 - **Corsi**: nell'elenco le lezioni sono raggruppate in cartelle, una per corso. *Nuovo corso* crea un corso con le sue parole chiave. *Parole chiave*, accanto al nome di un corso, apre la sua pagina: lì modifichi nome e parole chiave, aggiungi una registrazione già assegnata al corso o elimini il corso (le lezioni restano, in *Senza corso*). Dalla pagina di una lezione, *Sposta* la assegna a un altro corso; su Drive i file la seguono.
@@ -115,11 +120,10 @@ Serve perché il tuo sito possa leggere e scrivere i file di Sbobina nel tuo Dri
 
 ## Limiti da sapere
 
-- **Quote gratuite** (ottobre 2026, per progetto Google, azzerate alle 9:00 italiane):
+- **Quote gratuite** (ottobre 2026, per progetto Google, azzerate alla mezzanotte del Pacifico: le 9:00 italiane, le 8:00 nella settimana tra i due cambi d'ora):
 
   | Modello | Richieste/min | Token/min | Richieste/giorno |
   | --- | --- | --- | --- |
-  | gemini-3.5-transcribe | 3 | 10.000 | 25 |
   | gemini-3.8-flash | 5 | 250.000 | 20 |
   | gemini-3.7-flash | 5 | 250.000 | 20 |
 

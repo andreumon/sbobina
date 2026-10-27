@@ -145,7 +145,8 @@ export async function diagnose(gemini, { audio, settings, vocabulary = [], onSte
   };
 
   // undefined = da provare, null = non verificabile adesso (quota), oggetto = variante trovata
-  let transcribe, revise;
+  // Il modello di trascrizione dedicato non si usa più (limite di 10.000 token al minuto): non si prova.
+  let transcribe = false, revise;
   for (const f of formats) {
     for (const transport of ['uri', 'inline']) {
       if (transcribe === undefined) {
@@ -186,8 +187,7 @@ export async function diagnose(gemini, { audio, settings, vocabulary = [], onSte
 
 export function describeStrategy(s) {
   const fmt = x => `${x.format === 'wav' ? 'WAV' : 'audio originale'}, ${x.transport === 'uri' ? 'file caricato' : 'inline'}`;
-  const t = s.transcribe.use ? `modello di trascrizione (${fmt(s.transcribe)}${s.transcribe.vocab ? '' : ', senza vocabolario'})` : `modello di revisione (${fmt(s.transcribe)})`;
-  return `trascrizione con ${t}; revisione via ${s.revise.endpoint === 'generate' ? 'generateContent' : 'Interactions'} (${fmt(s.revise)})`;
+  return `trascrizione grezza con Whisper (Groq) o, senza Groq, con il modello di revisione; revisione via ${s.revise.endpoint === 'generate' ? 'generateContent' : 'Interactions'} (${fmt(s.revise)})`;
 }
 
 export const isRequestShapeError = e => e instanceof ApiError && e.status === 400;

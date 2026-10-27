@@ -129,10 +129,16 @@ export function rawFromSegments(segments) {
     const gapBefore = k ? (Number(s.start) || 0) - (Number(segs[k - 1].end) || 0) : Infinity;
     const gapAfter = k < segs.length - 1 ? (Number(segs[k + 1].start) || 0) - (Number(s.end) || 0) : Infinity;
     const lonely = SHORT_PHANTOM.test(text) && ((gapBefore >= 2 && gapAfter >= 2) || (s.no_speech_prob ?? 0) > 0.3);
+    // «...», «-», «?»: nessuna parola, è Whisper che segna un silenzio.
+    const noWords = !/[\p{L}\p{N}]/u.test(text);
     repeats = text.toLowerCase() === prev ? repeats + 1 : 0;
     prev = text.toLowerCase();
-    if (silent || looping || phantom || lonely || repeats >= 2) {
-      droppedItems.push({ start: Number(s.start) || 0, text, why: phantom ? 'frase tipica dei sottotitoli' : lonely ? 'frase breve isolata nel silenzio' : looping ? 'ripetizione in loop' : repeats >= 2 ? 'ripetuta' : 'silenzio' });
+    // Una frase ripetuta è un'invenzione solo se Whisper era incerto o se il giro continua a lungo:
+    // un prof che detta ("carattere maiuscolo… carattere maiuscolo…") ripete davvero, con voce chiara.
+    const unsure = (s.avg_logprob ?? 0) < -0.8 || (s.no_speech_prob ?? 0) > 0.4;
+    const repeated = repeats >= 2 && (unsure || repeats >= 4);
+    if (noWords || silent || looping || phantom || lonely || repeated) {
+      droppedItems.push({ start: Number(s.start) || 0, text, why: noWords ? 'nessuna parola' : phantom ? 'frase tipica dei sottotitoli' : lonely ? 'frase breve isolata nel silenzio' : looping ? 'ripetizione in loop' : repeated ? 'ripetuta' : 'silenzio' });
       return;
     }
     kept.push({ start: Number(s.start) || 0, end: Number(s.end) || 0, text });

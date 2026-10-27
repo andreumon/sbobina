@@ -161,6 +161,7 @@
           <button type="button" data-act="details">Dettagli</button>
           <button type="button" data-act="move">Sposta</button>
           <button type="button" data-act="rename">Rinomina</button>
+          <button type="button" data-act="date">Cambia data</button>
           <button type="button" data-act="drive" hidden>Apri su Drive</button>
           <button type="button" data-act="delete" class="danger">Elimina</button>
         </nav>
@@ -311,14 +312,11 @@
             </div>
             <label class="check"><input type="checkbox" id="sLight"> Invii leggeri: prima di inviare un blocco lo converto in Opus mono (circa 8 volte più piccolo, stessa resa per il riconoscimento del parlato)</label>
             <p class="help" id="sLightNote" hidden></p>
+            <label class="check"><input type="checkbox" id="sAwake"> Tieni lo schermo acceso durante l'elaborazione, finché l'app è aperta in primo piano (su questo dispositivo)</label>
             <label class="check"><input type="checkbox" id="sRevise"> Revisione: punteggiatura, paragrafi, correzioni dal contesto</label>
             <label class="check"><input type="checkbox" id="sRelisten"> Durante la revisione il modello riascolta l'audio (serve per i tempi dei paragrafi)</label>
             <details class="advanced">
               <summary>Modelli</summary>
-              <div class="field">
-                <label for="sTModel">Modello di trascrizione</label>
-                <input id="sTModel" spellcheck="false">
-              </div>
               <div class="field">
                 <label for="sRModel">Modello di revisione</label>
                 <input id="sRModel" spellcheck="false">

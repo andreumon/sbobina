@@ -33,7 +33,8 @@ class RedoExpired extends Error {}
 const GEN_CONFIG = { maxOutputTokens: 32768, thinkingLevel: 'low' };
 const MAX_INLINE_WAIT = 6 * 60_000;        // oltre questa attesa la lezione va "in attesa" e libera la coda
 const SWITCH_IF_WAIT = 2 * 60_000;         // se un modello va atteso più di così, si preferisce un altro libero
-const KEY_OFFLINE_PAUSE = 2 * 60_000;      // una chiave che non risponde (rete) si salta per 2 minuti
+const KEY_OFFLINE_PAUSE = 2 * 60_000;
+const PENDING_MAX_MS = 6 * 3600_000;         // una revisione in background si riprende entro 6 ore      // una chiave che non risponde (rete) si salta per 2 minuti
 
 /** Nessun modello disponibile adesso: la lezione si rimette in coda all'ora indicata. */
 export class BusyError extends Error {
@@ -494,10 +495,10 @@ async function runJob(id, ctx) {
         const secs = chunk.end - chunk.start;
         const info = { chunk: i, total };
         const range = chunk.mode === 'range' ? [chunk.start, chunk.end] : null;
-        const candidates = [
-          ...(chunk.mode !== 'range' && strategy.transcribe.use ? [{ model: settings.transcribeModel, kind: 'transcribe' }] : []),
-          ...chain.map(model => ({ model, kind: 'generate' })),
-        ];
+        // Senza Groq la trascrizione grezza la fanno gli stessi modelli della revisione.
+        // (gemini-3.5-transcribe non si usa più: nel piano gratuito accetta 10.000 token al minuto,
+        // mentre un blocco di 45 minuti ne vale circa 86.000, quindi verrebbe sempre rifiutato.)
+        const candidates = chain.map(model => ({ model, kind: 'generate' }));
         progress({ step: 'transcribe', ...info });
         let raw, engine;
         if (groq && !groqOff && chunk.mode !== 'range') {
@@ -512,7 +513,7 @@ async function runJob(id, ctx) {
               if (c.kind === 'transcribe') {
                 return withLightFallback(async () => c.key.gemini.transcribe({ model: c.model, audio: await audioFor(i, strategy.transcribe, c.key), language: lang.codes, vocabulary: strategy.transcribe.vocab ? vocabulary : [], maxOutputTokens: 32768, overloadRetries: 0 }));
               }
-              return withLightFallback(async () => c.key.gemini.generate({ model: c.model, audio: await audioFor(i, strategy.revise, c.key), endpoint: strategy.revise.endpoint, label: 'Trascrizione', config: GEN_CONFIG, overloadRetries: 0,
+              return withLightFallback(async () => c.key.gemini.generate({ model: c.model, audio: await audioFor(i, strategy.revise, c.key), endpoint: strategy.revise.endpoint, label: 'Trascrizione', config: GEN_CONFIG, overloadRetries: 0, background: true,
                 prompt: transcriptionPrompt({ course: job.course, glossary: glossaryText, range, lang }) }));
             },
           }));
@@ -547,13 +548,38 @@ async function runJob(id, ctx) {
           start: chunk.start, end: chunk.end, prevTail: i > 0 ? tailOf(job.chunks[i - 1]) : '',
           withAudio, range: chunk.mode === 'range' ? [chunk.start, chunk.end] : null,
         });
-        const { text, model, ms: revMs } = await runStep({
+        // Revisione rimasta in corso su Google (app chiusa o telefono riavviato durante l'attesa):
+        // si riprende a chiedere il risultato invece di rimandare tutto da capo.
+        let resumed = null;
+        const pend = chunk.pendingRev;
+        const pendKey = pend && keys.find(k => k.tag === pend.keyTag && !deadKeys.has(k.tag));
+        if (pend && pendKey && Date.now() - pend.at < PENDING_MAX_MS && pend.raw === chunk.raw.length && (!strongOnly || pool.includes(pend.model))) {
+          progress({ step: 'revise', ...info, model: pend.model, reserve: pend.keyTag !== '' });
+          await log(`Blocco ${i + 1}: riprendo la revisione rimasta in corso su Google (${pend.model})`);
+          try {
+            const t = await pendKey.gemini.resumeInteraction(pend.id, 'Revisione');
+            gemini = pendKey.gemini;
+            resumed = { text: t, model: pend.model, ms: Date.now() - pend.at };
+          } catch (e) {
+            if (e.name === 'AbortError') throw e;
+            await log(`Blocco ${i + 1}: la revisione in corso non è recuperabile (${e.message}), la richiedo di nuovo`);
+          }
+        }
+        if (pend) job = await patch(j => { delete j.chunks[i].pendingRev; });
+        const { text, model, ms: revMs } = resumed || await runStep({
           label: 'Revisione', candidates: chain.map(m => ({ model: m, kind: 'generate' })),
           tokens: quota.estimateTokens(withAudio ? chunk.end - chunk.start : 0, prompt.length), info,
           call: async c => {
             progress({ step: 'revise', ...info, model: c.model, reserve: c.key.tag !== '' });
-            return withLightFallback(async () => c.key.gemini.generate({ model: c.model, prompt, endpoint: strategy.revise.endpoint, label: 'Revisione', config: GEN_CONFIG, overloadRetries: 0,
-              audio: withAudio ? await audioFor(i, strategy.revise, c.key) : null }));
+            try {
+              return await withLightFallback(async () => c.key.gemini.generate({ model: c.model, prompt, endpoint: strategy.revise.endpoint, label: 'Revisione', config: GEN_CONFIG, overloadRetries: 0,
+                audio: withAudio ? await audioFor(i, strategy.revise, c.key) : null,
+                background: true,
+                onStarted: async id => { job = await patch(j => { j.chunks[i].pendingRev = { id, model: c.model, keyTag: c.key.tag, at: Date.now(), raw: chunk.raw.length }; }); },
+              }));
+            } finally {
+              if (job.chunks[i]?.pendingRev) job = await patch(j => { delete j.chunks[i].pendingRev; });
+            }
           },
         });
         const revised = stripFences(text);
@@ -568,7 +594,7 @@ async function runJob(id, ctx) {
         const warn = warns.join(' ') || null;
         if (warn) await log(`Blocco ${i + 1}: ${warn}`);
         await log(`Blocco ${i + 1}: rivisto con ${model}${lastKeyTag ? ' (chiave di riserva)' : ''} in ${fmtDur(revMs)}`);
-        job = await patch(j => { Object.assign(j.chunks[i], { revised, paragraphs, ratio: check.ratio, warn, reviseEngine: model }); });
+        job = await patch(j => { Object.assign(j.chunks[i], { revised, paragraphs, ratio: check.ratio, warn, reviseEngine: model }); delete j.chunks[i].pendingRev; });
       } else {
         job = await patch(j => { const c = j.chunks[i]; c.paragraphs = paragraphsFromRaw(c.raw || '', c.start); });
       }

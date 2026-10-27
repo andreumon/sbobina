@@ -79,6 +79,10 @@ export function explainError(e) {
   return e?.detail ? `${msg} (${e.detail})` : msg;
 }
 
+const PENDING = ['in_progress', 'queued', 'pending', 'running', 'processing'];
+const POLL_MAX_MS = 30 * 60_000;
+let backgroundRejected = false; // Google ha rifiutato la modalità in background: non si riprova in questa sessione
+
 export class Gemini {
   /** netRetries: tentativi dopo un errore di rete (meno se c'è un'altra chiave a cui passare). */
   constructor(apiKey, { log = () => {}, signal, netRetries = 5 } = {}) {
@@ -219,24 +223,68 @@ export class Gemini {
     try { await this.call(`/v1beta/${name}`, { method: 'DELETE' }, { retries: 0 }); } catch { /* scade comunque in 48 ore */ }
   }
 
-  /** Chiamata alla Interactions API, con attesa se la risposta è asincrona. */
+  /**
+   * Chiamata alla Interactions API. Con background: true Google risponde subito con un numero di
+   * pratica e lavora per conto suo: qui si chiede a intervalli se il risultato è pronto. Se il
+   * telefono si addormenta o perde la rete, il lavoro non va perso: alla domanda successiva c'è.
+   * onStarted(id) riceve il numero di pratica (per riprendere l'attesa dopo un riavvio dell'app).
+   */
   async interact(body, label, opts = {}) {
+    const { onStarted, ...callOpts } = opts;
     let { body: out } = await this.call('/v1beta/interactions', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    }, { label, ...opts });
-    const pending = ['in_progress', 'queued', 'pending', 'running', 'processing'];
-    for (let i = 0; out?.id && pending.includes(String(out.status).toLowerCase()); i++) {
-      if (i > 400) throw new ApiError('Il modello non ha risposto in tempo.', 0);
-      await sleep(3000, this.signal);
-      const path = out.id.startsWith('interactions/') ? `/v1beta/${out.id}` : `/v1beta/interactions/${out.id}`;
-      ({ body: out } = await this.call(path, {}, { label }));
+    }, { label, ...callOpts });
+    if (out?.id && PENDING.includes(String(out.status).toLowerCase())) {
+      try { await onStarted?.(out.id); } catch { /* solo un promemoria */ }
+      out = await this.pollInteraction(out.id, label);
     }
+    return this.finishInteraction(out);
+  }
+
+  /** Riprende l'attesa di una richiesta in background già inviata (es. prima di chiudere l'app). */
+  async resumeInteraction(id, label = 'Revisione') {
+    return this.finishInteraction(await this.pollInteraction(id, label));
+  }
+
+  finishInteraction(out) {
     const st = String(out?.status || '').toLowerCase();
     if (['failed', 'cancelled', 'canceled'].includes(st)) {
-      throw new ApiError(out?.error?.message || 'Il modello non ha completato la richiesta.', 500, out);
+      // In background un sovraccarico o un limite arrivano qui come "failed": si conserva il codice
+      // (503, 429…) così il dosatore delle quote lo tratta come se fosse arrivato subito.
+      const code = Number(out?.error?.code);
+      throw new ApiError(out?.error?.message || 'Il modello non ha completato la richiesta.', code >= 400 && code < 600 ? code : 500, out);
     }
     this.last = { status: st, truncated: st === 'incomplete', usage: out?.usage || null };
     return extractText(out);
+  }
+
+  /**
+   * Domande "è pronta?" ogni 5 s (10 s dopo i primi due minuti), fino a 30 minuti.
+   * Gli errori di rete e i rifiuti momentanei non interrompono l'attesa: il lavoro è sui server di Google.
+   */
+  async pollInteraction(id, label, { maxMs = POLL_MAX_MS } = {}) {
+    const path = id.startsWith('interactions/') ? `/v1beta/${id}` : `/v1beta/interactions/${id}`;
+    const t0 = Date.now();
+    let netLogged = false;
+    for (;;) {
+      const elapsed = Date.now() - t0;
+      if (elapsed > maxMs) throw new ApiError('Il modello non ha risposto in tempo.', 504);
+      await sleep(elapsed < 120_000 ? 5000 : 10_000, this.signal);
+      let out;
+      try {
+        ({ body: out } = await this.call(path, {}, { label, retries: 0, overloadRetries: 0 }));
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+        if (e.status === 404) throw new ApiError('Google non ha più il risultato di questa richiesta.', 404, e.body);
+        if (e.status === 0 && !netLogged) {
+          netLogged = true;
+          this.log(`${label}: rete assente durante l'attesa; Google continua a lavorare, riprovo a chiedere il risultato`);
+        }
+        if (e.status === 0 || e.status === 429 || e.status >= 500) continue;
+        throw e;
+      }
+      if (!PENDING.includes(String(out?.status).toLowerCase())) return out;
+    }
   }
 
   /**
@@ -245,8 +293,9 @@ export class Gemini {
    * endpoint: 'interactions' (predefinito) o 'generate' (generateContent).
    * config: { maxOutputTokens, thinkingLevel } facoltativi; se Google li rifiuta si riprova senza.
    */
-  async generate({ model, prompt, audio, label, endpoint = 'interactions', config, overloadRetries }) {
+  async generate({ model, prompt, audio, label, endpoint = 'interactions', config, overloadRetries, background = false, onStarted }) {
     const opts = overloadRetries === undefined ? {} : { overloadRetries };
+    if (background) { opts.background = true; opts.onStarted = onStarted; }
     const useCfg = config && !this.noConfig;
     try {
       return await this.generateOnce({ model, prompt, audio, label, endpoint, config: useCfg ? config : null, opts });
@@ -269,9 +318,19 @@ export class Gemini {
         if (config.maxOutputTokens) body.generation_config.max_output_tokens = config.maxOutputTokens;
         if (config.thinkingLevel) body.generation_config.thinking_level = config.thinkingLevel;
       }
+      const { background, ...rest } = opts;
+      const bg = background && !backgroundRejected;
+      if (bg) body.background = true;
       try {
-        return await this.interact(body, label, opts);
+        return await this.interact(body, label, rest);
       } catch (e) {
+        if (bg && e.status === 400 && /background/i.test(e.message)) {
+          // Google non accetta la modalità in background (per esempio nel piano gratuito): richiesta normale.
+          backgroundRejected = true;
+          this.log(`${label}: Google non accetta la richiesta in background (${e.message}), uso quella normale`);
+          delete body.background;
+          return this.interact(body, label, rest);
+        }
         if (e.status !== 404 || /model/i.test(e.message)) throw e;
         this.log('Interactions API non disponibile, uso generateContent');
         this.legacy = true;
@@ -282,10 +341,11 @@ export class Gemini {
     parts.push({ text: prompt });
     const req = { contents: [{ role: 'user', parts }] };
     if (config?.maxOutputTokens) req.generationConfig = { maxOutputTokens: config.maxOutputTokens };
+    const { background: _bg, onStarted: _os, ...callOpts } = opts;
     const { body } = await this.call(`/v1beta/models/${model}:generateContent`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req),
-    }, { label, ...opts });
+    }, { label, ...callOpts });
     const finish = body?.candidates?.[0]?.finishReason;
     this.last = { status: finish, truncated: finish === 'MAX_TOKENS', usage: body?.usageMetadata || null };
     return extractText(body);

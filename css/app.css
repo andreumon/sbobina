@@ -405,6 +405,8 @@ button.quiet:hover { color: var(--ink); text-decoration-color: var(--accent); }
 .file-card { padding: 4px 0 14px; margin-bottom: 18px; border-bottom: 1px solid var(--line); }
 .file-card .file-name { color: var(--muted); font-size: 0.85rem; margin: 0 0 8px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 .file-card .row input[type="date"] { flex: 0 0 170px; min-width: 0; }
+.file-card input.needs-check { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.file-card .date-check { color: var(--accent); margin: 6px 0 0; }
 
 .course { padding: 12px 0; border-bottom: 1px solid var(--line); }
 .course:first-child { padding-top: 0; }
@@ -464,6 +466,27 @@ button.quiet:hover { color: var(--ink); text-decoration-color: var(--accent); }
   li:hover > .row-more, .row-more:focus-visible { opacity: 1; pointer-events: auto; }
   .row-more:hover { background: var(--accent-soft); color: var(--ink); }
 }
+/* ---------- Riordino ---------- */
+.reorder-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin: 4px 12px 8px; padding: 8px 8px 8px 14px; border-radius: var(--radius);
+  background: var(--accent-soft); color: var(--ink); font-size: 0.9rem;
+}
+.course-lectures .reorder-bar { margin: 4px 0 8px; }
+.reorder-bar b { color: var(--accent); font-weight: 600; }
+.reordering .row-more { display: none; }
+.reordering .row-btn { cursor: default; padding-right: 60px; }
+.reordering .row-btn:hover { background: none; }
+.course-lectures .reordering .row-btn:hover .l-title { text-decoration: none; }
+.drag-handle {
+  position: absolute; right: 6px; top: 50%; transform: translateY(-50%); width: 44px; height: 44px;
+  border: 0; border-radius: var(--radius); background: none; color: var(--accent);
+  font: 600 1.35rem/1 var(--sans); cursor: grab; touch-action: none;
+}
+.drag-handle:hover, .drag-handle:focus-visible { background: var(--accent-soft); }
+.reordering li.dragging { background: var(--surface); box-shadow: 0 2px 12px rgba(0, 0, 0, 0.25); z-index: 2; border-radius: var(--radius); }
+.reordering li.dragging .drag-handle { cursor: grabbing; }
+
 .sheet-backdrop { position: fixed; inset: 0; z-index: 40; background: rgba(8, 11, 18, 0.42); }
 .sheet {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 41; background: var(--surface);
@@ -515,6 +538,9 @@ button.quiet:hover { color: var(--ink); text-decoration-color: var(--accent); }
 .search-course { padding: 6px 0 0; font-size: 0.88rem; }
 mark.hit { background: var(--accent-soft); color: inherit; border-radius: 2px; box-shadow: 0 0 0 1px var(--accent); }
 mark.hit.now { background: var(--accent); color: var(--bg); }
+/* Risultati "simili" (non esatti): solo sottolineati, così si distinguono a colpo d'occhio */
+mark.hit.similar { background: none; box-shadow: none; text-decoration: underline 2px var(--accent); text-underline-offset: 3px; }
+mark.hit.similar.now { background: var(--accent-soft); color: inherit; box-shadow: 0 0 0 1px var(--accent); }
 .search-results { font-family: var(--sans); }
 .sheet-results { padding: 0 20px 8px; }
 .course-search { margin: 8px 0 18px; max-width: 620px; }
@@ -531,6 +557,7 @@ mark.hit.now { background: var(--accent); color: var(--bg); }
 .sr-time { color: var(--accent); font-weight: 500; font-variant-numeric: tabular-nums; flex: none; min-width: 3.4em; }
 .sr-snip { color: var(--muted); }
 .sr-snip mark { background: var(--accent-soft); color: var(--ink); border-radius: 2px; }
+.sr-snip mark.similar { background: none; text-decoration: underline 2px var(--accent); text-underline-offset: 3px; }
 .sr-more { width: auto; padding: 4px 6px; color: var(--muted); font-size: 0.85rem; }
 
 /* ---------- Indice ---------- */

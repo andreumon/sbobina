@@ -11,13 +11,13 @@ import { guessMime, cleanForPlayback } from './aac.js';
 import { diagnose, describeStrategy, saveStrategy, resetStrategy, loadStrategy } from './strategy.js';
 import {
   fmtTime, lectureParagraphs, toMarkdown, safeFileName, countUncertain, toEditable, parseEditable, parseTime,
-  marksIn, resolveMark,
+  marksIn, resolveMark, dateFromName,
 } from './text.js';
 import { LANGS } from './prompts.js';
 import * as quota from './quota.js';
 import { Groq, explainGroq, groqUsage, GROQ_DAILY_SEC } from './groq.js';
 import { canMakeLight } from './light.js';
-import { makeIndex, rereviewParagraph, wordDiff, searchLectures, foldChar, fold } from './assist.js';
+import { makeIndex, rereviewParagraph, wordDiff, searchLectures, foldChar, fold, makeQuery, matchText } from './assist.js';
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -177,6 +177,7 @@ async function renderList() {
     </section>`;
   }).join('');
   $('emptyList').hidden = groups.length > 0;
+  if (state.reorder?.where === 'lectureList') applyReorder();
 }
 
 function markCurrentRow() {
@@ -191,7 +192,7 @@ function markCurrentRow() {
 
 $('lectureList').addEventListener('click', e => {
   const row = e.target.closest('.row-btn');
-  if (row) { openLecture(row.dataset.id); return; }
+  if (row) { if (!row.closest('.reordering')) openLecture(row.dataset.id); return; }
   const folder = e.target.closest('.folder');
   if (!folder) return;
   const name = folder.dataset.course;
@@ -209,7 +210,10 @@ $('lectureList').addEventListener('click', e => {
 $('newCourseBtn').addEventListener('click', () => openCourse(null));
 
 let listTimer;
-const refreshList = () => { clearTimeout(listTimer); listTimer = setTimeout(renderList, 120); };
+const refreshList = () => {
+  if (state.dragging) { state.refreshAfterDrag = true; return; } // non ridisegnare sotto il dito
+  clearTimeout(listTimer); listTimer = setTimeout(renderList, 120);
+};
 
 // ====================================================================
 // Corsi (cartelle)
@@ -239,12 +243,15 @@ async function openCourse(name, { push = true } = {}) {
   $('courseLectures').innerHTML = course
     ? (jobs.length ? `<h3>Lezioni</h3><ol>${jobs.map(lectureRow).join('')}</ol>` : '<p class="help">Ancora nessuna lezione in questo corso.</p>')
     : '';
+  if (state.reorder?.where === 'courseLectures') {
+    if (state.reorder.course === course?.name) applyReorder(); else state.reorder = null;
+  }
   if (!course) $('courseName').focus();
 }
 
 $('courseLectures').addEventListener('click', e => {
   const row = e.target.closest('.row-btn');
-  if (row) openLecture(row.dataset.id);
+  if (row && !row.closest('.reordering')) openLecture(row.dataset.id);
 });
 
 $('courseForm').addEventListener('submit', async e => {
@@ -360,7 +367,7 @@ $('moveSel').addEventListener('change', async () => {
 });
 
 async function moveLecture(id, course) {
-  await store.updateJob(id, j => { j.course = course; });
+  await store.updateJob(id, j => { if ((j.course || '') !== (course || '')) delete j.rank; j.course = course; });
   const closed = new Set(store.device.get('closedFolders', []));
   closed.delete(course);
   store.device.set('closedFolders', [...closed]);
@@ -394,10 +401,10 @@ function addPending(items) {
 }
 
 function defaultTitle(file) {
-  const base = file.name.replace(/\.[^.]+$/, '').replace(/[_]+/g, ' ').trim();
+  const base = dateFromName(file.name).title;
   const generic = /^(registrazione|recording|rec|audio|voice|nota|record)?[\s\d\-–.:]*$/i.test(base);
   if (!generic) return base;
-  const d = new Date(file.lastModified || Date.now());
+  const d = new Date(dateFromName(file.name).date || Date.now());
   return `Lezione del ${d.toLocaleDateString('it-IT', { day: 'numeric', month: 'long' })}`;
 }
 
@@ -414,8 +421,9 @@ function renderNew() {
         <label for="nt${i}">Titolo</label>
         <div class="row">
           <input id="nt${i}" data-i="${i}" class="new-title" value="${esc(defaultTitle(p.file))}">
-          <input type="date" id="nd${i}" data-i="${i}" class="new-date" value="${dateInputValue(p.file.lastModified)}" aria-label="Data della lezione">
+          <input type="date" id="nd${i}" data-i="${i}" class="new-date${dateFromName(p.file.name).date ? '' : ' needs-check'}" value="${dateInputValue(dateFromName(p.file.name).date)}" aria-label="Data della lezione">
         </div>
+        ${dateFromName(p.file.name).date ? '' : `<p class="help date-check" id="ndc${i}">Data non trovata nel nome del file: ho messo oggi, controllala. (Per averla in automatico, chiama la registrazione «MATERIA_TITOLO GG_MM».)</p>`}
       </div>
     </div>`).join('');
   const sel = $('newCourse');
@@ -440,6 +448,12 @@ function fillGlossary() {
   const c = settings.courses.find(x => x.name === name);
   $('newGlossary').value = c?.glossary || '';
 }
+$('newFiles').addEventListener('input', e => {
+  const d = e.target.closest('.new-date');
+  if (!d) return;
+  d.classList.remove('needs-check');
+  $(`ndc${d.dataset.i}`)?.remove();
+});
 $('newCourse').addEventListener('change', () => { fillGlossary(); if ($('newCourse').value === '__new') $('newCourseName').focus(); });
 
 $('cancelNew').addEventListener('click', async () => {
@@ -483,7 +497,7 @@ $('newForm').addEventListener('submit', async e => {
       const { file, inboxId } = state.pending[i];
       const title = document.querySelector(`.new-title[data-i="${i}"]`).value.trim() || defaultTitle(file);
       const dateVal = document.querySelector(`.new-date[data-i="${i}"]`).value;
-      const recordedAt = dateVal ? new Date(`${dateVal}T12:00:00`).getTime() : (file.lastModified || Date.now());
+      const recordedAt = dateVal ? new Date(`${dateVal}T12:00:00`).getTime() : (dateFromName(file.name).date || Date.now());
       const id = crypto.randomUUID();
       await store.putAudio(id, file);
       await store.putJob({
@@ -536,6 +550,7 @@ window.addEventListener('drop', e => {
 let wakeLock = null;
 async function keepAwake(on) {
   try {
+    if (on && !store.device.get('keepAwake', true)) on = false; // opzione nelle impostazioni (di questo dispositivo)
     if (on && !wakeLock && 'wakeLock' in navigator && document.visibilityState === 'visible') {
       wakeLock = await navigator.wakeLock.request('screen');
       wakeLock.addEventListener('release', () => { wakeLock = null; });
@@ -1317,52 +1332,63 @@ function clearHits() {
   }
 }
 
-/** Evidenzia le occorrenze di state.search.q nel testo mostrato (senza distinguere maiuscole e accenti). */
+/**
+ * Evidenzia i risultati di state.search.q nel testo mostrato: prima le frasi esatte (senza distinguere
+ * maiuscole e accenti), poi i risultati "simili" (parole in altro ordine, altre forme, errori di battitura).
+ * Ogni risultato è un gruppo di evidenziazioni (più parole); st.hits contiene i gruppi.
+ */
 function applySearch({ keep = false, para = null } = {}) {
   const st = state.search;
   if (!st) return;
   clearHits();
   st.hits = [];
-  const fq = fold(st.q.trim());
-  if (fq.length >= 2) {
-    const walker = document.createTreeWalker($('transcript'), NodeFilter.SHOW_TEXT, {
-      acceptNode: n => (n.parentElement.closest('.ts, .katex, #qpop, .pedit, .chunk-label, script, style') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
-    });
-    const nodes = [];
-    while (walker.nextNode()) nodes.push(walker.currentNode);
-    for (const node of nodes) {
-      const ft = Array.from(node.data, foldChar).join('');
-      // Array.from conta i caratteri "doppi" (emoji) come uno: si torna agli indici della stringa
-      const map = []; let pos = 0;
-      for (const ch of node.data) { map.push(pos); pos += ch.length; }
-      map.push(pos);
-      const found = [];
-      let k = ft.indexOf(fq);
-      while (k >= 0) { found.push(k); k = ft.indexOf(fq, k + fq.length); }
-      let cur = node;
-      let consumed = 0;
-      for (const f of found) {
-        const start = map[f] - consumed, end = map[f + fq.length] - consumed;
-        const mid = cur.splitText(start);
-        const rest = mid.splitText(end - start);
+  const Q = makeQuery(st.q);
+  if (Q.fq.length >= 2) {
+    const exact = [], similar = [];
+    const blocks = $('transcript').querySelectorAll('.para');
+    for (const block of blocks.length ? blocks : [$('transcript')]) {
+      const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, {
+        acceptNode: n => (n.parentElement.closest('.ts, .katex, #qpop, .pedit, .chunk-label, script, style') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
+      });
+      const nodes = [];
+      let text = '';
+      while (walker.nextNode()) { nodes.push({ node: walker.currentNode, at: text.length }); text += walker.currentNode.data; }
+      const groups = matchText(text, Q);
+      if (!groups.length) continue;
+      // Intervalli da evidenziare, dal fondo: così spezzare un nodo non sposta quelli ancora da fare
+      const wraps = [];
+      groups.forEach((g, gi) => g.spans.forEach(([a, b]) => wraps.push({ a, b, gi })));
+      wraps.sort((x, y) => y.a - x.a);
+      const marksOf = groups.map(() => []);
+      for (const { a, b, gi } of wraps) {
+        const k = nodes.findLastIndex(n => n.at <= a);
+        if (k < 0) continue;
+        const { node, at } = nodes[k];
+        const s0 = a - at, e0 = Math.min(b - at, node.data.length);
+        if (e0 <= s0) continue;
+        const mid = node.splitText(s0);
+        mid.splitText(e0 - s0);
         const mark = document.createElement('mark');
-        mark.className = 'hit';
+        mark.className = groups[gi].exact ? 'hit' : 'hit similar';
         mid.parentNode.insertBefore(mark, mid);
         mark.appendChild(mid);
-        st.hits.push(mark);
-        cur = rest;
-        consumed = map[f + fq.length];
+        marksOf[gi].unshift(mark);
       }
+      groups.forEach((g, gi) => { if (marksOf[gi].length) (g.exact ? exact : similar).push({ marks: marksOf[gi], exact: g.exact }); });
     }
+    st.hits = [...exact, ...similar];
+    st.exactCount = exact.length;
   }
+  const top = h => h.marks[0].getBoundingClientRect().top;
   if (!st.hits.length) st.cur = -1;
   else if (para !== null) {
-    const k = st.hits.findIndex(h => h.closest('.para')?.dataset.i === String(para));
+    const k = st.hits.findIndex(h => h.marks[0].closest('.para')?.dataset.i === String(para));
     st.cur = k >= 0 ? k : 0;
   } else if (keep && st.cur >= 0) st.cur = Math.min(st.cur, st.hits.length - 1);
   else {
-    // Il primo risultato a partire da dove si sta leggendo
-    const k = st.hits.findIndex(h => h.getBoundingClientRect().top >= 80);
+    // Il primo risultato esatto a partire da dove si sta leggendo (o il primo simile, se non ce ne sono)
+    const pool = st.exactCount ? st.hits.slice(0, st.exactCount) : st.hits;
+    const k = pool.findIndex(h => top(h) >= 80);
     st.cur = k >= 0 ? k : 0;
   }
   showHit(!keep);
@@ -1371,10 +1397,11 @@ function applySearch({ keep = false, para = null } = {}) {
 function showHit(scroll = true) {
   const st = state.search;
   const n = st?.hits?.length || 0;
-  $('searchCount').textContent = !st || fold(st.q.trim()).length < 2 ? '' : n ? `${st.cur + 1} di ${n}` : 'nessun risultato';
+  const cur = n ? st.hits[st.cur] : null;
+  $('searchCount').textContent = !st || makeQuery(st.q).fq.length < 2 ? '' : n ? `${st.cur + 1} di ${n}${cur && !cur.exact ? ' · simile' : ''}` : 'nessun risultato';
   $('searchPrev').disabled = $('searchNext').disabled = n < 2;
-  st?.hits?.forEach((h, k) => h.classList.toggle('now', k === st.cur));
-  if (scroll && n) st.hits[st.cur].scrollIntoView({ behavior: 'smooth', block: 'center' });
+  st?.hits?.forEach((h, k) => h.marks.forEach(m => m.classList.toggle('now', k === st.cur)));
+  if (scroll && n) cur.marks[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
 function openSearch(q = null, { para = null } = {}) {
@@ -1419,11 +1446,16 @@ function searchResultsHtml(results, q) {
   if (fold(q.trim()).length < 2) return '';
   if (!results.length) return `<p class="help">Nessun risultato per «${esc(q.trim())}».</p>`;
   const total = results.reduce((n, r) => n + r.hits.length, 0);
-  return `<p class="help">${total} ${total === 1 ? 'risultato' : 'risultati'} in ${results.length} ${results.length === 1 ? 'lezione' : 'lezioni'}</p>` + results.map(({ job, hits }) => {
+  const exact = results.reduce((n, r) => n + (r.exact || 0), 0);
+  const kinds = exact === total ? '' : exact ? ` (${exact} esatti, ${total - exact} simili)` : ' (tutti simili: nessuna corrispondenza esatta)';
+  return `<p class="help">${total} ${total === 1 ? 'risultato' : 'risultati'}${kinds} in ${results.length} ${results.length === 1 ? 'lezione' : 'lezioni'}</p>` + results.map(({ job, hits }) => {
     const long = (job.duration || 0) >= 3600;
     const items = hits.slice(0, 5).map(h => {
       const s = h.snippet;
-      return `<li><button type="button" class="sr-hit" data-id="${job.id}" data-i="${h.i}"><span class="sr-time">${fmtTime(h.t, long)}</span><span class="sr-snip">${h.pre ? '…' : ''}${esc(s.slice(0, h.off))}<mark>${esc(s.slice(h.off, h.off + h.len))}</mark>${esc(s.slice(h.off + h.len))}${h.post ? '…' : ''}</span></button></li>`;
+      let body = '', at = 0;
+      for (const [a, b] of h.marks || [[h.off, h.off + h.len]]) { body += `${esc(s.slice(at, a))}<mark${h.exact === false ? ' class="similar"' : ''}>${esc(s.slice(a, b))}</mark>`; at = b; }
+      body += esc(s.slice(at));
+      return `<li><button type="button" class="sr-hit" data-id="${job.id}" data-i="${h.i}"><span class="sr-time">${fmtTime(h.t, long)}</span><span class="sr-snip">${h.pre ? '…' : ''}${body}${h.post ? '…' : ''}</span></button></li>`;
     }).join('');
     const more = hits.length > 5 ? `<button type="button" class="quiet sr-hit sr-more" data-id="${job.id}" data-i="${hits[5].i}">altri ${hits.length - 5} nella lezione</button>` : '';
     return `<div class="sr-lecture"><p class="sr-title">${esc(job.title)} <span>· ${hits.length}</span></p><ol>${items}</ol>${more}</div>`;
@@ -1541,7 +1573,7 @@ async function startRedo(id, mode) {
   await store.updateJob(id, j => {
     j.prevVersions = [currentVersion(j, 'prima della nuova revisione'), ...(j.prevVersions || [])].slice(0, 2);
     for (const c of j.chunks || []) {
-      if (typeof c.raw === 'string' && c.raw) { delete c.revised; delete c.paragraphs; delete c.warn; delete c.ratio; delete c.reviseEngine; }
+      if (typeof c.raw === 'string' && c.raw) { delete c.revised; delete c.paragraphs; delete c.warn; delete c.ratio; delete c.reviseEngine; delete c.pendingRev; }
     }
     delete j.edited;
     delete j.notice;
@@ -1740,6 +1772,18 @@ async function lectureAction(act, id, from = 'menu') {
         </form>`, { id, keep: true });
       $('sheetInput').select();
       break;
+    case 'date':
+      openSheet(`
+        <form class="sheet-form" data-form="date">
+          <label for="sheetDate">Data della lezione</label>
+          <input type="date" id="sheetDate" value="${dateInputValue(job.recordedAt || job.createdAt)}">
+          <div class="form-actions"><button type="submit" class="primary">Salva</button><button type="button" class="quiet" data-close>Annulla</button></div>
+        </form>`, { id, keep: true });
+      $('sheetDate').focus();
+      break;
+    case 'reorder':
+      startReorder(job.course || '');
+      break;
     case 'move':
       if (from === 'page') {
         await fillMoveSelect(job);
@@ -1819,7 +1863,9 @@ async function openLectureMenu(id, pos = {}) {
     ['open', 'Apri'],
     ...(canResume ? [['resume', 'Riprendi elaborazione']] : []),
     ['rename', 'Rinomina'],
+    ['date', 'Cambia data'],
     ['move', 'Sposta in un altro corso'],
+    ['reorder', 'Riordina'],
     ...(hasText ? [['edit', 'Modifica testo'], ...(job.status === 'done' ? [['index', job.index ? 'Indice' : 'Crea indice']] : []), ['copy', 'Copia testo'], ['save', 'Salva .md'], ...(navigator.share ? [['share', 'Condividi']] : [])] : []),
     ...(job.status === 'done' && hasText ? [['redo', 'Rivedi di nuovo tutto il testo']] : []),
     ['details', 'Dettagli elaborazione'],
@@ -1859,12 +1905,24 @@ $('sheet').addEventListener('click', async e => {
   const b = e.target.closest('[data-act]');
   if (!b) return;
   const act = b.dataset.act;
-  if (act !== 'rename' && act !== 'move') closeSheet();
+  if (!['rename', 'move', 'date'].includes(act)) closeSheet();
   lectureAction(act, id, 'menu');
 });
 $('sheet').addEventListener('submit', async e => {
   e.preventDefault();
   const id = $('sheet').dataset.id;
+  if (e.target.dataset.form === 'date') {
+    const d = $('sheetDate')?.value;
+    closeSheet();
+    if (!d) return;
+    await store.updateJob(id, j => { j.recordedAt = new Date(`${d}T12:00:00`).getTime(); });
+    if (state.jobId === id) renderLecture();
+    refreshList();
+    if (state.view === 'course') openCourse(state.courseName, { push: false });
+    sync.run();
+    toast('Data aggiornata');
+    return;
+  }
   const v = $('sheetInput')?.value.trim();
   closeSheet();
   if (!v) return;
@@ -1876,12 +1934,13 @@ $('sheet').addEventListener('submit', async e => {
 });
 
 // Pressione prolungata (telefono), tasto destro e pulsante ⋯ (PC) sulle righe delle lezioni.
-let pressTimer = null, pressStart = null, suppressClick = false;
+let pressTimer = null, pressStart = null, suppressClick = false, menuFrom = 'lectureList';
 function bindRowMenus(container) {
   container.addEventListener('pointerdown', e => {
     suppressClick = false; // nuovo gesto
+    menuFrom = container.id;
     const row = e.target.closest('.row-btn');
-    if (!row || e.pointerType === 'mouse') return;
+    if (!row || e.pointerType === 'mouse' || row.closest('.reordering')) return;
     pressStart = { x: e.clientX, y: e.clientY };
     clearTimeout(pressTimer);
     pressTimer = setTimeout(() => {
@@ -1902,14 +1961,22 @@ function bindRowMenus(container) {
     const row = e.target.closest('.row-btn');
     if (!row) return;
     e.preventDefault();
+    menuFrom = container.id;
+    if (row.closest('.reordering')) return;
     if (suppressClick) return; // il menu è già aperto dalla pressione prolungata
     const touch = e.pointerType ? e.pointerType !== 'mouse' : !matchMedia('(pointer: fine)').matches;
     openLectureMenu(row.dataset.id, touch ? {} : { x: e.clientX, y: e.clientY });
   });
   container.addEventListener('click', e => {
     if (suppressClick) { e.stopImmediatePropagation(); e.preventDefault(); suppressClick = false; return; }
+    // In modalità riordino le righe non si aprono: si spostano con la maniglia.
+    if (e.target.closest('.reordering') && !e.target.closest('[data-reorder-done]')) {
+      if (e.target.closest('.row-btn, .row-more')) { e.stopImmediatePropagation(); e.preventDefault(); }
+      return;
+    }
     const more = e.target.closest('.row-more');
     if (more) {
+      menuFrom = container.id;
       e.stopImmediatePropagation();
       const r = more.getBoundingClientRect();
       openLectureMenu(more.dataset.id, { x: r.left - 160, y: r.bottom + 4 });
@@ -1918,6 +1985,131 @@ function bindRowMenus(container) {
 }
 bindRowMenus($('lectureList'));
 bindRowMenus($('courseLectures'));
+
+// --------------------------------------------------------------------
+// Riordino delle lezioni di un corso: "Riordina" nel menù, poi si trascina la maniglia ≡.
+// L'ordine si salva come "rank" (0 = in cima) su tutte le lezioni del corso; una lezione
+// nuova non ha rank e quindi va in cima. Cambiando corso il rank si azzera.
+// --------------------------------------------------------------------
+
+/** Lista (ol) del corso nel contenitore in cui si sta riordinando. */
+function reorderList() {
+  const r = state.reorder;
+  if (!r) return null;
+  if (r.where === 'courseLectures') return state.view === 'course' && state.courseName === r.course ? $('courseLectures').querySelector('ol') : null;
+  const folder = [...$('lectureList').querySelectorAll('.folder')].find(f => f.dataset.course === r.course);
+  return folder?.querySelector('ol.lectures') || null;
+}
+
+function startReorder(course) {
+  const where = menuFrom === 'courseLectures' && state.view === 'course' && state.courseName === course ? 'courseLectures' : 'lectureList';
+  state.reorder = { course, where };
+  if (where === 'lectureList') {
+    const closed = new Set(store.device.get('closedFolders', []));
+    if (closed.delete(course)) store.device.set('closedFolders', [...closed]);
+    if (!isWide()) { show('home'); history.pushState({ v: 'home' }, ''); }
+    renderList(); // riapplica la modalità dopo il disegno
+  } else applyReorder();
+}
+
+function applyReorder() {
+  const ol = reorderList();
+  if (!ol) return;
+  ol.closest('.folder')?.setAttribute('data-open', 'true');
+  ol.classList.add('reordering');
+  for (const li of ol.children) {
+    if (li.querySelector('.drag-handle')) continue;
+    const id = li.querySelector('.row-btn')?.dataset.id;
+    li.insertAdjacentHTML('afterbegin', `<button type="button" class="drag-handle" data-id="${id}" aria-label="Sposta ${esc(li.querySelector('.l-title')?.textContent || '')}: trascina, oppure frecce su e giù">≡</button>`);
+  }
+  if (!ol.previousElementSibling?.classList.contains('reorder-bar')) {
+    ol.insertAdjacentHTML('beforebegin', `<div class="reorder-bar"><span>Trascina <b>≡</b> per cambiare l'ordine</span><button type="button" class="primary" data-reorder-done>Fine</button></div>`);
+  }
+  ol.closest('.folder, #courseLectures')?.scrollIntoView({ block: 'nearest' });
+}
+
+function stopReorder() {
+  state.reorder = null;
+  renderList();
+  if (state.view === 'course') openCourse(state.courseName, { push: false });
+}
+
+async function saveOrder(ol) {
+  const ids = [...ol.querySelectorAll(':scope > li .row-btn')].map(b => b.dataset.id);
+  let changed = false;
+  for (let k = 0; k < ids.length; k++) {
+    const j = await store.getJob(ids[k]);
+    if (j && j.rank !== k) { await store.updateJob(ids[k], x => { x.rank = k; }); changed = true; }
+  }
+  if (changed) sync.run();
+}
+
+function scrollParent(el) {
+  for (let p = el.parentElement; p; p = p.parentElement) {
+    const o = getComputedStyle(p).overflowY;
+    if ((o === 'auto' || o === 'scroll') && p.scrollHeight > p.clientHeight) return p;
+  }
+  return document.scrollingElement;
+}
+
+for (const box of [$('lectureList'), $('courseLectures')]) {
+  box.addEventListener('click', e => {
+    if (e.target.closest('[data-reorder-done]')) { e.stopPropagation(); stopReorder(); }
+  });
+  box.addEventListener('pointerdown', e => {
+    const h = e.target.closest('.drag-handle');
+    if (!h) return;
+    e.preventDefault();
+    const li = h.closest('li'), ol = li.parentElement;
+    const scroller = scrollParent(ol);
+    h.setPointerCapture(e.pointerId);
+    li.classList.add('dragging');
+    state.dragging = true;
+    let y = e.clientY, raf = 0;
+    const place = () => {
+      // Si sposta la riga oltre la vicina quando il dito ne supera la metà.
+      const prev = li.previousElementSibling, next = li.nextElementSibling;
+      // (si spostano le vicine, non la riga trascinata: spostarla nel DOM le farebbe perdere il dito)
+      if (prev && y < prev.getBoundingClientRect().top + prev.offsetHeight / 2) li.after(prev);
+      else if (next && y > next.getBoundingClientRect().top + next.offsetHeight / 2) li.before(next);
+    };
+    const edge = () => {
+      const top = scroller === document.scrollingElement ? 0 : scroller.getBoundingClientRect().top;
+      const bottom = scroller === document.scrollingElement ? innerHeight : scroller.getBoundingClientRect().bottom;
+      const v = y < top + 56 ? -10 : y > bottom - 56 ? 10 : 0;
+      if (v) { scroller.scrollBy(0, v); place(); }
+      raf = requestAnimationFrame(edge);
+    };
+    raf = requestAnimationFrame(edge);
+    const pid = e.pointerId;
+    const move = ev => { if (ev.pointerId === pid) { y = ev.clientY; place(); } };
+    const end = async ev => {
+      if (ev.pointerId !== pid) return;
+      cancelAnimationFrame(raf);
+      removeEventListener('pointermove', move);
+      removeEventListener('pointerup', end);
+      removeEventListener('pointercancel', end);
+      li.classList.remove('dragging');
+      state.dragging = false;
+      await saveOrder(ol);
+      if (state.refreshAfterDrag) { state.refreshAfterDrag = false; refreshList(); }
+    };
+    addEventListener('pointermove', move);
+    addEventListener('pointerup', end);
+    addEventListener('pointercancel', end);
+  });
+  box.addEventListener('keydown', async e => {
+    const h = e.target.closest('.drag-handle');
+    if (!h || !['ArrowUp', 'ArrowDown'].includes(e.key)) return;
+    e.preventDefault();
+    const li = h.closest('li'), ol = li.parentElement;
+    if (e.key === 'ArrowUp' && li.previousElementSibling) li.after(li.previousElementSibling);
+    else if (e.key === 'ArrowDown' && li.nextElementSibling) li.before(li.nextElementSibling);
+    h.focus();
+    await saveOrder(ol);
+  });
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && state.reorder && $('sheet').hidden) stopReorder(); });
 
 function download(name, text) {
   const url = URL.createObjectURL(new Blob([text], { type: 'text/markdown;charset=utf-8' }));
@@ -2106,10 +2298,11 @@ function renderSettings() {
   $('sRevise').checked = settings.revise;
   $('sRelisten').checked = settings.relisten;
   $('sRelisten').disabled = !settings.revise;
-  $('sTModel').value = settings.transcribeModel;
   $('sRModel').value = settings.reviseModel;
   $('sLang').innerHTML = langOptions(settings.defaultLang || 'it');
   renderQuota();
+  $('sAwake').checked = store.device.get('keepAwake', true);
+  $('sAwake').closest('label').hidden = !('wakeLock' in navigator);
   $('sTheme').value = store.device.get('theme', 'auto');
   $('sClient').value = store.device.get('clientId', '');
   $('sClientField').hidden = !!DRIVE_CLIENT_ID;
@@ -2140,11 +2333,11 @@ for (const [input, show, test, result, field] of [['sKey', 'sKeyShow', 'sKeyTest
     out.textContent = 'Verifico…';
     try {
       const models = await new Gemini(key).listModels();
-      const t = models.includes(settings.transcribeModel), r = models.includes(settings.reviseModel);
-      out.classList.add(t && r ? 'ok' : 'bad');
-      out.textContent = t && r
+      const r = models.includes(settings.reviseModel);
+      out.classList.add(r ? 'ok' : 'bad');
+      out.textContent = r
         ? 'Chiave valida, modelli disponibili.'
-        : `Chiave valida, ma non trovo ${[!t && settings.transcribeModel, !r && settings.reviseModel].filter(Boolean).join(' e ')}. Modelli disponibili: ${models.filter(m => /gemini/.test(m)).slice(0, 12).join(', ')}…`;
+        : `Chiave valida, ma non trovo ${settings.reviseModel}. Modelli disponibili: ${models.filter(m => /gemini/.test(m)).slice(0, 12).join(', ')}…`;
       if (field === 'apiKey2' && (settings.apiKey || '').trim()) {
         out.textContent += ' Controllo che sia di un altro progetto…';
         const same = await sameProject(settings.apiKey.trim(), key);
@@ -2232,7 +2425,6 @@ $('sGroqTest').addEventListener('click', async () => {
 });
 $('sRevise').addEventListener('change', () => { saveSetting({ revise: $('sRevise').checked }); $('sRelisten').disabled = !$('sRevise').checked; });
 $('sRelisten').addEventListener('change', () => saveSetting({ relisten: $('sRelisten').checked }));
-$('sTModel').addEventListener('change', () => saveSetting({ transcribeModel: $('sTModel').value.trim() }));
 $('sRModel').addEventListener('change', () => saveSetting({ reviseModel: $('sRModel').value.trim() }));
 $('sLang').addEventListener('change', () => saveSetting({ defaultLang: $('sLang').value }));
 
@@ -2249,6 +2441,7 @@ function renderQuota() {
     $('sQuota').insertAdjacentHTML('beforeend', `<p><span>Whisper su Groq</span><span>${Math.round(g.sec / 60)} / ${Math.round(GROQ_DAILY_SEC / 60)} minuti di audio</span></p>`);
   }
 }
+$('sAwake').addEventListener('change', () => { store.device.set('keepAwake', $('sAwake').checked); keepAwake(!!state.runner && $('sAwake').checked); });
 $('sTheme').addEventListener('change', () => { store.device.set('theme', $('sTheme').value); applyTheme(); });
 $('sClient').addEventListener('change', () => {
   store.device.set('clientId', $('sClient').value.trim());
